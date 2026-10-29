@@ -18,3 +18,11 @@ summary(boxcox_teste)
 
 dados <- dados %>%
   mutate(preco_log = log10(preco))
+
+set.seed(123)
+
+split_casas <- initial_split(dados, prop = 0.80, strata = preco)
+treino_casas <- training(split_casas)
+teste_casas  <- testing(split_casas)
+
+cv_folds <- vfold_cv(treino_casas, v = 10, strata = preco)
