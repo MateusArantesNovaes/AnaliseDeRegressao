@@ -26,3 +26,6 @@ treino_casas <- training(split_casas)
 teste_casas  <- testing(split_casas)
 
 cv_folds <- vfold_cv(treino_casas, v = 10, strata = preco)
+
+save(dados, split_casas, treino_casas, teste_casas, cv_folds, 
+     file = "data/dados_preparados.RData")
