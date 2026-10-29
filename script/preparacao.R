@@ -11,7 +11,10 @@ dados <- dados %>%
              ar_condicionado, area_preferencial), as.factor)
   )
 
-#conferindo tratamento das variaveis categoricas
-X_exemplo <- model.matrix(~ ., data = head(dados, 5))
-print("Matriz de desenho")
-print(head(X_exemplo))
+modelo_preliminar <- lm(preco ~ ., data = dados)
+boxcox_teste <- car::powerTransform(modelo_preliminar)
+
+summary(boxcox_teste)
+
+dados <- dados %>%
+  mutate(preco_log = log10(preco))
