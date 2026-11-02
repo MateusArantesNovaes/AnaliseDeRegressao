@@ -1,0 +1,111 @@
+```{r setup, include=FALSE}
+# Carrega os pacotes necessários
+library(tidyverse)
+library(reglin)
+library(car)
+library(broom)
+
+# Carrega os dados preparados, incluindo a divisão de treino e teste
+load("data/dados_preparados.RData")
+```
+
+## Parte 2: Modelos Lineares Múltiplos e Seleção de Variáveis
+
+Essa etapa tem como objetivo ajustar um modelo linear múltiplo capaz de prever o logaritmo do preço dos imóveis (`preco_log`), avaliando a contribuição de diferentes blocos de características e aplicando métodos de seleção para encontrar o modelo que melhor explica os dados usando o menor número possível de variáveis explicativas.
+
+### 2.1. Ajuste do Modelo Completo
+
+O primeiro passo consistiu em ajustar um modelo completo que usa todas variáveis preditoras disponíveis no conjunto de treinamento. Esse modelo serve como uma base para compreendermos a capacidade máxima de explicação dos dados antes de fazer qualquer simplificação. A variável resposta utilizada foi o `preco_log` para estabilizar a variância conforme indicado pelo teste de Box-Cox realizado na etapa de preparação.
+
+```{r modelo-completo}
+# Ajuste do modelo linear múltiplo utilizando todas as variáveis disponíveis
+mod_completo <- lm(
+  preco_log ~ area_lote + quartos + banheiros + andares + 
+    entrada_carro + area_recreacao + porao + aquecimento_gas + 
+    ar_condicionado + vagas_garagem + area_preferencial, 
+  data = treino_casas
+)
+
+# Tabela ANOVA (teste F global) e summary
+summary(mod_completo)
+reglin::tab_anova(mod_completo)
+```
+
+O modelo completo mostrou-se estatisticamente significativo ($F = 80{,}21$; $p < 0{,}001$). Isso confirma que o conjunto de variáveis selecionadas, nesse caso todas as disponíveis, contribui para explicar o valor das casas. O coeficiente de determinação ajustado ($R^2_{\text{adj}}$) foi de 66,75%, o que pode ser interpretado como a quantidade de variabilidade dos dados que é explicada pelo modelo de regressão. Contudo, é válido ressaltar que o $R^2$ não deve ser utilizado de forma indiscriminada para julgar a adequação de um modelo. Além disso, um $R^2$ alto não implica necessariamente que o modelo fornecerá previsões acuradas para observações futuras. É exatamente por isso que, nas etapas seguintes, vamos usar métricas mais robustas para validação e comparação, como o AIC e a estatística PRESS.
+
+### 2.2. Testes de Somas de Quadrados Extra
+
+Para testar estatísticamente se poderíamos simplificar o modelo removendo categorias inteiras sem perder previsibilidade, aplicamos os testes de Somas de Quadrados Extra. Basicamente, vamos verificar se a exclusão de um bloco de variáveis aumenta significativamente a soma de quadrados dos resíduos (erro) do modelo.
+
+Agrupamos as variáveis em três blocos: características internas da casa, estrutura da casa e vagas de garagem e localização.
+
+**Teste 1: Características Internas**
+```{r sq-internas}
+# Removendo características internas da casa
+mod_sem_internas <- update(mod_completo, . ~ . - quartos - banheiros - 
+                             aquecimento_gas - ar_condicionado)
+anova(mod_sem_internas, mod_completo)
+```
+
+**Teste 2: Estruturas e Vagas**
+```{r sq-estruturas}
+# Removendo características estruturais da casa e vagas na garagem
+mod_sem_estruturas <- update(mod_completo, . ~ . - andares - entrada_carro - 
+                               area_recreacao - porao - vagas_garagem)
+anova(mod_sem_estruturas, mod_completo)
+```
+
+**Teste 3: Localização**
+```{r sq-localizacao}
+# Removendo a variável de área de preferência
+mod_sem_preferencia <- update(mod_completo, . ~ . - area_preferencial)
+anova(mod_sem_preferencia, mod_completo)
+```
+
+A análise dos testes revelou que nenhum dos blocos pode ser descartado. A remoção das características internas aumentou significativamente a soma de quadrados dos resíduos ($F = 27{,}913$; $p < 2{,}2 \times 10^{-16}$). O mesmo ocorreu ao testarmos a remoção das estruturas e vagas ($F = 21{,}785$; $p < 2{,}2 \times 10^{-16}$) e da área de preferência ($F = 19{,}442$; $p = 1{,}317 \times 10^{-5}$). Isso confirma a importância dessas características na precificação dos imóveis.
+
+### 2.3. Seleção Automática (Stepwise) e Comparação de Modelos
+
+Como os testes anteriores mostraram que todas as categorias possuem importância global, passamos para uma seleção variável a variável utilizando o método **Stepwise**. 
+
+Optamos pela direção **"both"** porque ela é a mais completa, uma vez que, a cada passo, o algoritmo testa tanto a inclusão de uma variável que ficou de fora quanto a exclusão de uma variável que já está no modelo. No entanto, as demais direções também foram testadas, mas não foram apresentadas aqui.
+
+```{r stepwise-execucao}
+# Modelo nulo contendo apenas o intercepto
+mod_nulo <- lm(preco_log ~ 1, data = treino_casas)
+
+# Usamos o algoritmo Stepwise na direção both
+step_both <- stats::step(mod_completo, direction = "both", 
+                         scope = list(lower = mod_nulo, upper = mod_completo), 
+                         trace = FALSE)
+modelo_stepwise <- step_both
+```
+
+Para validar a escolha, comparamos todos os modelos utilizando AIC e PRESS. O AIC "penaliza" o modelo por cada variável extra incluída, evitando que fiquemos adicionando variáveis desnecessárias. Já a estatística PRESS (Prediction Error Sum of Squares) mede a verdadeira capacidade do modelo de prever o valor de novas casas (dados que não foram usados no treinamento). Modelos que apresentam os menores valores de AIC e PRESS são preferíveis, pois indicam menos erros de previsão e maior eficiência.
+
+```{r comparacao}
+# Comparação de Modelos (AIC e PRESS)
+tab_comparativa <- data.frame(
+  Modelo = c("Completo", "Sem Internas", "Sem Estruturas", "Sem Preferência", "Stepwise (Both)"),
+  AIC = c(AIC(mod_completo), AIC(mod_sem_internas), 
+          AIC(mod_sem_estruturas), AIC(mod_sem_preferencia), AIC(step_both)),
+  PRESS = c(reglin::press(mod_completo), reglin::press(mod_sem_internas), 
+            reglin::press(mod_sem_estruturas), reglin::press(mod_sem_preferencia), 
+            reglin::press(step_both)),
+  R2_adj = c(summary(mod_completo)$adj.r.squared, 
+             summary(mod_sem_internas)$adj.r.squared,
+             summary(mod_sem_estruturas)$adj.r.squared, 
+             summary(mod_sem_preferencia)$adj.r.squared,
+             summary(step_both)$adj.r.squared)
+)
+
+print(tab_comparativa)
+```
+
+Os resultados do Stepwise convergiram para o modelo completo. O algoritmo determinou que a melhor configuração é manter todas as variáveis preditoras, pois o modelo completo apresentou o menor valor de AIC (-808,41) e a menor estatística PRESS (3,959), quando comparados aos modelos reduzidos que testamos anteriormente.
+
+```{r modelo-final}
+summary(modelo_stepwise)
+```
+
+Dessa forma, o modelo linear múltiplo final ficou com as 11 variáveis originais, uma vez que todas apresentaram significância individual ao nível de 5% ($p < 0{,}05$) e contribuem de forma independente para a minimização do erro de previsão.
