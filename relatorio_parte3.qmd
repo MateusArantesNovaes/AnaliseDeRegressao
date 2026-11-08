@@ -1,0 +1,256 @@
+```{r setup, include=FALSE}
+# Carrega os pacotes necessários
+library(tidyverse)
+library(tidymodels)
+library(reglin)
+library(car)
+library(splines2)
+
+# Carrega os dados preparados e os modelos ajustados
+load("data/dados_preparados.RData")
+load("data/parte2_modelos_lineares.RData")
+
+modelo <- mod_completo
+n <- nrow(treino_casas)
+```
+
+## Parte 3: Multicolinearidade, Regressão Polinomial, B-Splines e Padronização
+
+Essa etapa tem como objetivo verificar se existe dependência linear entre as variáveis explicativas do modelo completo, investigar a forma funcional da variável `area_lote` (que apresentou curvatura no gráfico de resíduos parciais da Parte 4) e comparar a importância relativa de cada variável sobre o preço das casas por meio de coeficientes padronizados.
+
+### 3.1. Diagnóstico de Multicolinearidade
+
+A multicolinearidade ocorre quando as variáveis explicativas são fortemente correlacionadas entre si. Nesse caso, a matriz $X^\top X$ se aproxima de uma matriz singular e a variância dos estimadores, dada por $V(\hat{\beta}_j) = \sigma^2 C_{jj}$, com $C = (X^\top X)^{-1}$, fica inflacionada. Isso torna as estimativas instáveis, podendo inclusive inverter o sinal de alguns coeficientes. Para diagnosticar esse problema utilizamos o fator de inflação da variância, $VIF_j = 1/(1 - R^2_j)$, onde $R^2_j$ é o coeficiente de determinação da regressão de $x_j$ sobre as demais variáveis explicativas. Valores de VIF acima de 10 indicam multicolinearidade séria.
+
+```{r vif}
+# VIF de cada variável
+vif_completo <- car::vif(modelo)
+vif_completo
+any(vif_completo > 10)
+```
+
+Todos os valores de VIF ficaram entre 1,05 (`aquecimento_gas`) e 1,49 (`andares`), muito abaixo do limiar de 10. Isso indica que as variáveis explicativas do modelo completo são praticamente não correlacionadas entre si e que a variância dos estimadores não está sendo inflacionada.
+
+Como todas as variáveis do modelo possuem apenas 1 grau de liberdade, a função `car::vif()` retorna o VIF clássico. Para avaliar o caso de variáveis com mais de dois níveis, ajustamos uma versão do modelo tratando `andares` e `vagas_garagem` como fatores (uma variável com $a$ níveis gera $a-1$ colunas na matriz $X$). Nesse caso, o VIF generalizado (GVIF) deve ser comparado por meio de $GVIF^{1/(2 \cdot Df)}$ com o limiar $\sqrt{10} \approx 3{,}162$.
+
+```{r gvif}
+# GVIF tratando andares e vagas_garagem como fator
+mod_fatores <- update(modelo, . ~ . - andares - vagas_garagem + factor(andares) + factor(vagas_garagem))
+gvif_tab <- car::vif(mod_fatores)
+gvif_tab
+
+# Compara GVIF^(1/(2*Df)) com o limiar sqrt(10)
+gvif_tab[, "GVIF^(1/(2*Df))"] > sqrt(10)
+```
+
+O maior valor de $GVIF^{1/(2 \cdot Df)}$ foi 1,28 (`quartos`), novamente muito abaixo do limiar. Por fim, verificamos numericamente a expressão da variância dos estimadores e calculamos o número de condição da matriz $X$.
+
+```{r variancia}
+# Variância dos estimadores: V(beta_j) = sigma^2 * C_jj
+X <- model.matrix(modelo)
+C <- solve(t(X) %*% X)
+all.equal(sigma(modelo)^2 * diag(C), diag(vcov(modelo)))
+
+# Número de condição da matriz X
+kappa(X, exact = TRUE)
+```
+
+O número de condição de 2761 não se deve à multicolinearidade, e sim à diferença de escala entre as colunas de $X$: a `area_lote` assume valores na casa das centenas de metros quadrados, enquanto as variáveis indicadoras assumem apenas 0 ou 1. Os VIFs, que não dependem da escala, confirmam que não há multicolinearidade no modelo completo.
+
+### 3.2. Regressão Polinomial em `area_lote`
+
+Na Parte 4, o gráfico de resíduos parciais da variável `area_lote` mostrou uma curvatura, indicando que a relação com o `preco_log` não é estritamente linear. Para investigar isso, primeiro incluímos um termo quadrático no modelo.
+
+```{r quadratico}
+# Termo quadrático em area_lote
+mod_quad <- update(modelo, . ~ . + I(area_lote^2))
+summary(mod_quad)
+anova(modelo, mod_quad)
+```
+
+O termo quadrático foi significativo ($F = 11{,}254$; $p = 0{,}00087$) e possui coeficiente negativo, o que indica que o preço cresce com o tamanho do lote, mas a uma taxa decrescente. Em seguida, ajustamos polinômios de grau 1 a 6 em `area_lote`, mantendo as demais variáveis. Utilizamos `poly(..., raw = TRUE)` para que os coeficientes correspondam diretamente às potências de `area_lote`, preservando a interpretação. Para cada grau, calculamos o AIC, a estatística PRESS, o $R^2$ ajustado, o determinante de $X^\top X$ e o número de condição de $X$.
+
+```{r graus}
+# Modelos de grau 1 a 6
+mod_grau1 <- modelo
+mod_grau2 <- update(modelo, . ~ . - area_lote + poly(area_lote, degree = 2, raw = TRUE))
+mod_grau3 <- update(modelo, . ~ . - area_lote + poly(area_lote, degree = 3, raw = TRUE))
+mod_grau4 <- update(modelo, . ~ . - area_lote + poly(area_lote, degree = 4, raw = TRUE))
+mod_grau5 <- update(modelo, . ~ . - area_lote + poly(area_lote, degree = 5, raw = TRUE))
+mod_grau6 <- update(modelo, . ~ . - area_lote + poly(area_lote, degree = 6, raw = TRUE))
+
+modelos_grau <- list(mod_grau1, mod_grau2, mod_grau3, mod_grau4, mod_grau5, mod_grau6)
+
+# Tabela de sensibilidade do grau
+tab_grau <- data.frame(
+  Grau = 1:6,
+  AIC = sapply(modelos_grau, AIC),
+  PRESS = sapply(modelos_grau, reglin::press),
+  R2_adj = sapply(modelos_grau, function(m) summary(m)$adj.r.squared),
+  Det_XtX = sapply(modelos_grau, function(m) det(crossprod(model.matrix(m)))),
+  Kappa = sapply(modelos_grau, function(m) kappa(model.matrix(m), exact = TRUE))
+)
+
+print(tab_grau)
+
+# Teste sequencial entre os graus
+anova(mod_grau1, mod_grau2, mod_grau3, mod_grau4)
+```
+
+O polinômio de grau 3 apresentou simultaneamente o menor AIC (-826,55) e a menor estatística PRESS (3,799). A partir do grau 4, os dois critérios voltam a piorar, sinal de que os termos extras passam a ajustar ruído (sobreajuste). O teste sequencial de somas de quadrados extra confirma esse resultado: os termos de grau 2 ($p = 0{,}0008$) e 3 ($p = 0{,}0013$) são significativos, enquanto o de grau 4 não é ($p = 0{,}81$).
+
+A tabela também mostra o mal condicionamento da matriz à medida que o grau aumenta. O número de condição de $X$ cresce de $2{,}8 \times 10^{3}$ no grau 1 para $6{,}0 \times 10^{19}$ no grau 6. A partir do grau 5 ele ultrapassa $1/\varepsilon \approx 4{,}5 \times 10^{15}$ (o inverso da precisão numérica do computador), ou seja, as estimativas desses modelos ficam numericamente pouco confiáveis. Já o determinante de $X^\top X$ cresce em vez de se aproximar de zero, porque depende da escala das colunas ($area\_lote^6$ é da ordem de $10^{18}$). Por isso, nesse caso, o número de condição é o indicador mais adequado.
+
+O uso de potências não centralizadas também gera multicolinearidade estrutural, já que `area_lote` e `area_lote^2` são fortemente correlacionadas.
+
+```{r vif-polinomio}
+# Correlação entre area_lote e area_lote^2
+car::vif(mod_quad)
+cor(treino_casas$area_lote, treino_casas$area_lote^2)
+
+# Centralizando area_lote para reduzir essa correlação
+treino_casas <- treino_casas %>% mutate(area_c = area_lote - mean(area_lote))
+mod_quad_c <- update(modelo, . ~ . - area_lote + area_c + I(area_c^2), data = treino_casas)
+car::vif(mod_quad_c)
+```
+
+No modelo quadrático, a correlação entre `area_lote` e `area_lote^2` é de 0,959, e os VIFs desses dois termos sobem para 15,1 e 13,8. Ao centralizar a variável em torno da média, os VIFs caem para 2,15 e 1,69, sem alterar os valores ajustados do modelo. Isso mostra que essa multicolinearidade é apenas consequência da forma como o polinômio foi construído, e não um problema dos dados.
+
+Como alternativa ao polinômio, também testamos a transformação logarítmica de `area_lote`, que captura o crescimento a taxa decrescente com um único parâmetro.
+
+```{r log-area}
+# Transformação logarítmica em area_lote
+mod_logarea <- update(modelo, . ~ . - area_lote + log10(area_lote))
+summary(mod_logarea)
+```
+
+Com a transformação, o coeficiente de `log10(area_lote)` foi de 0,317 ($p < 0{,}001$). Como o preço também está em escala logarítmica, esse coeficiente pode ser interpretado como uma elasticidade: mantidas as demais características, um aumento de 1% no tamanho do lote está associado a um aumento de aproximadamente 0,32% no preço da casa.
+
+Por fim, selecionamos o grau com menor PRESS e verificamos novamente o gráfico de resíduos parciais. Como a função `reglin::ggresiduals(type = "crPlots")` não aceita termos com `poly()` ou `I()`, utilizamos a função `car::crPlots()`.
+
+```{r crplot-polinomio}
+# Escolhe o grau com menor PRESS
+grau_otimo <- which.min(tab_grau$PRESS)
+modelo_polinomial <- modelos_grau[[grau_otimo]]
+summary(modelo_polinomial)
+
+car::crPlots(modelo_polinomial)
+```
+
+Após o ajuste do polinômio de grau 3, a linha suavizada dos resíduos parciais acompanha a reta do componente ajustado, indicando que a curvatura observada na Parte 4 foi corrigida.
+
+### 3.3. B-Splines Cúbicos com Validação Cruzada
+
+Uma alternativa mais flexível aos polinômios são os B-splines cúbicos, que dividem o intervalo de `area_lote` em partes (separadas por nós) e ajustam um polinômio cúbico em cada uma delas. O número de graus de liberdade (`deg_free`) controla a quantidade de nós e, portanto, a flexibilidade da curva. Para escolher esse valor sem sobreajuste, utilizamos os 10 lotes de validação cruzada criados na Parte 1 dentro do ecossistema `tidymodels`, testando de 3 a 12 graus de liberdade.
+
+```{r splines-cv}
+receita_spline <- recipe(
+  preco_log ~ area_lote + quartos + banheiros + andares + entrada_carro +
+    area_recreacao + porao + aquecimento_gas + ar_condicionado +
+    vagas_garagem + area_preferencial,
+  data = treino_casas
+) %>%
+  step_spline_b(area_lote, deg_free = tune(), degree = 3) %>%
+  step_dummy(all_nominal_predictors())
+
+wf_spline <- workflow() %>%
+  add_recipe(receita_spline) %>%
+  add_model(linear_reg() %>% set_engine("lm"))
+
+# Testa de 3 a 12 graus de liberdade nos 10 folds
+set.seed(123)
+tune_spline <- tune_grid(
+  wf_spline,
+  resamples = cv_folds,
+  grid = data.frame(deg_free = 3:12),
+  metrics = metric_set(rmse, rsq)
+)
+
+autoplot(tune_spline)
+show_best(tune_spline, metric = "rmse")
+
+# Escolhe o modelo mais simples dentro de 1 erro-padrão do melhor
+melhor_df <- select_by_one_std_err(tune_spline, deg_free, metric = "rmse")
+melhor_df
+```
+
+O menor RMSE médio na validação cruzada foi obtido com 3 graus de liberdade (RMSE = 0,0934), e o critério de 1 erro-padrão também escolheu esse valor. Aumentar a flexibilidade da curva não melhorou a capacidade preditiva. O aviso exibido durante a validação cruzada ocorre porque, em alguns lotes, a parte de validação contém casas com `area_lote` fora do intervalo observado na parte de treino, o que exige extrapolar a curva.
+
+```{r splines-final}
+wf_spline_final <- finalize_workflow(wf_spline, melhor_df)
+fit_spline_tm <- fit(wf_spline_final, data = treino_casas)
+
+# Ajusta o mesmo modelo com lm para comparar com os demais
+df_spline <- melhor_df$deg_free
+modelo_spline <- update(modelo, . ~ . - area_lote + bSpline(area_lote, df = df_spline, degree = 3))
+summary(modelo_spline)
+```
+
+É importante notar que um B-spline cúbico com 3 graus de liberdade não possui nós internos, ou seja, é um único polinômio cúbico em todo o intervalo de `area_lote`. Por isso, o modelo de splines escolhido é equivalente ao polinômio de grau 3: os coeficientes da base são diferentes, mas os valores ajustados, os resíduos, o $R^2$ e o AIC são exatamente os mesmos. Assim, a validação cruzada confirma, por um caminho independente, o grau 3 escolhido pelo AIC e pelo PRESS.
+
+```{r comparacao-area}
+# Comparação dos tratamentos de area_lote
+tab_area <- data.frame(
+  Modelo = c("Linear", "Polinomial", "Log de area_lote", "B-Spline"),
+  AIC = c(AIC(modelo), AIC(modelo_polinomial), AIC(mod_logarea), AIC(modelo_spline)),
+  PRESS = c(reglin::press(modelo), reglin::press(modelo_polinomial),
+            reglin::press(mod_logarea), reglin::press(modelo_spline)),
+  R2_adj = c(summary(modelo)$adj.r.squared, summary(modelo_polinomial)$adj.r.squared,
+             summary(mod_logarea)$adj.r.squared, summary(modelo_spline)$adj.r.squared)
+)
+
+print(tab_area)
+```
+
+Todos os tratamentos não lineares melhoram o modelo linear original. O polinômio de grau 3 (e o B-spline equivalente) apresentou os melhores valores de AIC e PRESS, mas o modelo com `log10(area_lote)` ficou muito próximo (diferença de 1,5 no AIC e de 0,014 no PRESS) utilizando dois parâmetros a menos e com uma interpretação mais simples. Por isso, os dois candidatos são levados para a avaliação no conjunto de teste.
+
+### 3.4. Padronização de Variáveis
+
+Os coeficientes do modelo de regressão dependem das unidades de medida das variáveis, o que impede compará-los diretamente para saber qual variável tem maior influência sobre o preço. Para resolver isso, padronizamos as variáveis de duas formas, utilizando a função `reglin::standardization()`:
+
+- **Escala normal unitária:** $z_{ij} = (x_{ij} - \bar{x}_j)/s_j$, de modo que cada variável tenha média 0 e variância 1;
+- **Comprimento unitário:** $w_{ij} = (x_{ij} - \bar{x}_j)/\sqrt{S_{jj}}$, com $S_{jj} = \sum_i (x_{ij} - \bar{x}_j)^2$, de modo que cada coluna tenha média 0 e comprimento 1.
+
+Como as variáveis padronizadas são centradas, os modelos são ajustados sem intercepto. As variáveis indicadoras entram com seus valores 0 e 1.
+
+```{r padronizacao}
+# Matriz das covariáveis sem o intercepto
+Xs <- model.matrix(modelo)[, -1]
+y <- treino_casas$preco_log
+
+# Escala normal unitária (Z) e comprimento unitário (W)
+Z <- apply(Xs, 2, standardization, type = "normal")
+W <- apply(Xs, 2, standardization, type = "length")
+yZ <- standardization(y, type = "normal")
+yW <- standardization(y, type = "length")
+
+# Modelos padronizados sem intercepto
+mod_pad_normal <- lm(yZ ~ 0 + Z)
+mod_pad_length <- lm(yW ~ 0 + W)
+
+coef(mod_pad_normal)
+coef(mod_pad_length)
+
+# Verifica que (n - 1) W'W = Z'Z
+all.equal((n - 1) * crossprod(W), crossprod(Z))
+```
+
+As duas formas de padronização produzem exatamente os mesmos coeficientes padronizados, como esperado pela teoria, e a relação $(n-1)W^\top W = Z^\top Z$ foi confirmada numericamente. Vale lembrar que $W^\top W$ é a matriz de correlação das variáveis explicativas, e os elementos da diagonal da sua inversa são justamente os VIFs calculados na seção 3.1.
+
+```{r ranking}
+# Ranking da importância das variáveis
+b_pad <- coef(mod_pad_normal)
+names(b_pad) <- colnames(Xs)
+
+ranking <- data.frame(Variavel = names(b_pad), Coef_Padronizado = b_pad) %>%
+  arrange(desc(abs(Coef_Padronizado)))
+
+print(ranking)
+
+ggplot(ranking, aes(x = reorder(Variavel, abs(Coef_Padronizado)), y = Coef_Padronizado)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL, y = "Coeficiente padronizado")
+```
+
+O tamanho do lote é a variável com maior efeito sobre o preço (coeficiente padronizado de 0,301): um aumento de um desvio-padrão em `area_lote` está associado a um aumento de 0,30 desvio-padrão no `preco_log`, mantidas as demais variáveis constantes. Em seguida aparecem o número de andares (0,228), a presença de ar-condicionado central (0,206) e o número de banheiros (0,192). As variáveis com menor efeito relativo são o número de quartos (0,094) e a presença de sala de recreação (0,074), sendo esta última a única com significância apenas marginal no modelo polinomial ($p = 0{,}069$). Todos os coeficientes padronizados são positivos, ou seja, cada característica avaliada está associada a um aumento no valor de venda das casas.

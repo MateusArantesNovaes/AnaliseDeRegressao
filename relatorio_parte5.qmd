@@ -1,0 +1,162 @@
+```{r setup, include=FALSE}
+# Carrega os pacotes necessários
+library(tidyverse)
+library(reglin)
+library(car)
+
+# Carrega os dados preparados e os modelos ajustados
+load("data/dados_preparados.RData")
+load("data/parte2_modelos_lineares.RData")
+
+# Mesmo modelo usado na análise de resíduos (Parte 4)
+modelo <- modelo_stepwise
+n <- nobs(modelo)
+p <- length(coef(modelo))
+```
+
+## Parte 5: Alavancagem, Outliers, Medidas de Influência e Sensibilidade
+
+Essa etapa tem como objetivo identificar casas que, sozinhas, exercem uma influência desproporcional sobre o modelo ajustado, seja por possuírem características muito diferentes das demais (pontos de alavanca), seja por terem um preço muito diferente do previsto pelo modelo (outliers). Em seguida, avaliamos o quanto as conclusões do modelo mudam quando essas casas são retiradas da análise. Utilizamos o mesmo modelo analisado na Parte 4, ajustado com as 11 variáveis explicativas e com o `preco_log` como variável resposta, contendo $n = 435$ casas do conjunto de treino e $p = 12$ parâmetros.
+
+### 5.1. Medidas de Influência
+
+Para cada observação $i$ calculamos as seguintes medidas:
+
+- **Alavancagem ($h_{ii}$):** elemento da diagonal da matriz chapéu $H = X(X^\top X)^{-1}X^\top$. Mede o quão distante a casa está das demais no espaço das variáveis explicativas, sem depender do preço;
+- **DFBETAS:** variação padronizada de cada coeficiente $\hat{\beta}_j$ quando a observação $i$ é retirada do ajuste;
+- **DFFITS:** variação padronizada do valor ajustado $\hat{y}_i$ quando a observação $i$ é retirada do ajuste;
+- **Distância de Cook ($D_i$):** medida global da variação em todos os valores ajustados quando a observação $i$ é retirada;
+- **COVRATIO:** razão entre os determinantes da matriz de covariância dos estimadores sem e com a observação $i$. Valores maiores que 1 indicam que a observação aumenta a precisão das estimativas, e valores menores que 1 indicam que ela reduz a precisão.
+
+```{r medidas}
+infl <- influence.measures(modelo)
+summary(infl)
+
+h <- hatvalues(modelo)
+dfb <- dfbetas(modelo)
+dff <- dffits(modelo)
+cook <- cooks.distance(modelo)
+covr <- covratio(modelo)
+```
+
+Por padrão, a função `influence.measures()` marca 33 casas como potencialmente influentes, a maioria delas apenas pelo critério do COVRATIO. Como os critérios padrão do R são bastante sensíveis, utilizamos a seguir os limiares críticos adotados na disciplina.
+
+### 5.2. Análise Gráfica com os Limiares Críticos
+
+Seguindo os critérios de Cordeiro & Demétrio (2008), que são os mesmos utilizados nos gráficos da função `reglin::gginfluence()`, uma observação é considerada:
+
+- **Ponto de alavanca**, se $h_{ii} > 3p/n$;
+- **Influente nos coeficientes**, se $|DFBETAS_{j(i)}| > 1$;
+- **Influente no valor ajustado**, se $|DFFITS_{(i)}| > 3\sqrt{p/(n-p)}$;
+- **Influente globalmente**, se $D_{(i)} > F_{0{,}5;\,p,\,n-p}$;
+- **Influente na precisão**, se $|1 - COVRATIO_{(i)}| > 3p/(n-p)$.
+
+```{r limiares}
+limiares <- c(
+  leverage = 3 * p / n,
+  dfbetas = 1,
+  dffits = 3 * sqrt(p / (n - p)),
+  cooksd = qf(0.5, p, n - p),
+  covratio = 3 * p / (n - p)
+)
+limiares
+```
+
+```{r graficos-influencia}
+gginfluence(modelo, measure = "leverage")
+gginfluence(modelo, measure = "dfbetas")
+gginfluence(modelo, measure = "cooksd")
+gginfluence(modelo, measure = "dffits")
+gginfluence(modelo, measure = "covratio")
+```
+
+```{r marcacoes}
+# Marca as observações que passam de cada limiar
+diagnostico <- data.frame(
+  obs = 1:n,
+  preco = treino_casas$preco,
+  area_lote = treino_casas$area_lote,
+  alavanca = h > limiares["leverage"],
+  dfbetas = apply(abs(dfb), 1, max) > limiares["dfbetas"],
+  dffits = abs(dff) > limiares["dffits"],
+  cook = cook > limiares["cooksd"],
+  covratio = abs(1 - covr) > limiares["covratio"]
+)
+diagnostico$n_criterios <- rowSums(diagnostico[, c("alavanca", "dfbetas", "dffits", "cook", "covratio")])
+
+# Quantidade de casas marcadas por critério
+colSums(diagnostico[, c("alavanca", "dfbetas", "dffits", "cook", "covratio")])
+```
+
+Os gráficos e a contagem acima mostram que:
+
+- **Distância de Cook:** nenhuma casa ultrapassou o limiar de 0,947. O maior valor observado foi de aproximadamente 0,04, ou seja, nenhuma observação altera de forma relevante o ajuste como um todo;
+- **DFBETAS:** nenhuma casa ultrapassou o limiar de 1 em nenhum dos 12 coeficientes. Os maiores valores, em torno de 0,5, ocorreram no coeficiente de `aquecimento_gas`, característica presente em apenas 25 das 546 casas do banco de dados;
+- **Alavancagem:** 3 casas ultrapassaram o limiar de 0,083;
+- **DFFITS:** 8 casas ultrapassaram o limiar de 0,505;
+- **COVRATIO:** 30 casas ultrapassaram o limiar de 0,085, sendo o critério que mais marcou observações.
+
+Para verificar a presença de outliers na resposta, aplicamos também o teste de Bonferroni, que avalia o maior resíduo estudentizado externamente comparando-o com a distribuição $t_{n-p-1}$ e corrigindo o nível de significância pelo número de observações.
+
+```{r bonferroni}
+car::outlierTest(modelo)
+```
+
+O maior resíduo estudentizado em valor absoluto foi de -3,20 (observação 77). Após a correção de Bonferroni, o valor-p foi de 0,636, de modo que nenhuma casa pode ser considerada um outlier na resposta.
+
+Para focar nas casas mais atípicas, selecionamos aquelas marcadas por pelo menos dois critérios ao mesmo tempo. A numeração das observações se refere à posição da casa no conjunto de treino.
+
+```{r atipicas}
+atipicas <- diagnostico %>%
+  filter(n_criterios >= 2) %>%
+  arrange(desc(n_criterios))
+atipicas
+
+# Características dessas casas
+treino_casas[atipicas$obs, ]
+summary(treino_casas[, c("preco", "area_lote", "quartos", "banheiros", "andares", "vagas_garagem")])
+```
+
+Oito casas foram marcadas por dois critérios, e elas se dividem em dois grupos bem distintos:
+
+**Pontos de alavanca bem ajustados (observações 360, 371 e 373).** São casas com características extremas, mas cujo preço é coerente com o previsto pelo modelo. A observação 373 possui o maior lote de todo o banco de dados (1505 m², mais de três vezes a mediana de 427 m²), além de 5 quartos e 3 banheiros. A observação 371 tem um lote de 1226 m². Já a observação 360 é a única casa de todo o banco com 4 banheiros, além de 4 andares e 3 vagas de garagem. Essas três casas possuem DFFITS praticamente nulo e COVRATIO maior que 1, ou seja, elas seguem o padrão do modelo e, por estarem em regiões com poucas observações, aumentam a precisão das estimativas.
+
+**Casas com preço mal ajustado (observações 77, 100, 209, 318 e 335).** São casas com alavancagem comum, mas com DFFITS alto e COVRATIO menor que 1, ou seja, o modelo erra bastante o preço delas e elas reduzem a precisão das estimativas. Quatro delas possuem preço bem abaixo do esperado pelas suas características. A observação 100, por exemplo, custa US\$ 31.900 apesar de estar em um bairro de alta preferência e ter ar-condicionado central. A observação 209 custa US\$ 50.000 com um lote de 883 m², 3 vagas de garagem e localização em bairro de alta preferência. A observação 335 é o caso oposto: custa US\$ 132.000, valor bem acima do esperado para uma casa com lote de apenas 325 m².
+
+### 5.3. Estudo de Sensibilidade
+
+Para avaliar o impacto dessas casas sobre as conclusões, ajustamos novamente o modelo sem as 8 observações marcadas e calculamos a variação relativa de cada coeficiente:
+
+$$
+VR_j = 100 \times \frac{\hat{\beta}_{j,\,\text{sem pontos}} - \hat{\beta}_{j,\,\text{original}}}{|\hat{\beta}_{j,\,\text{original}}|}
+$$
+
+```{r sensibilidade}
+# Ajusta o modelo sem as casas atípicas
+modelo_sem <- update(modelo, data = treino_casas[-atipicas$obs, ])
+
+# Variação relativa dos coeficientes
+tab_sensibilidade <- data.frame(
+  Original = coef(modelo),
+  Sem_Atipicas = coef(modelo_sem),
+  VR = 100 * (coef(modelo_sem) - coef(modelo)) / abs(coef(modelo)),
+  p_Original = summary(modelo)$coefficients[, 4],
+  p_Sem_Atipicas = summary(modelo_sem)$coefficients[, 4]
+)
+
+print(tab_sensibilidade)
+
+# Compara as medidas globais dos dois modelos
+data.frame(
+  Modelo = c("Com todas as casas", "Sem as casas atípicas"),
+  n = c(nobs(modelo), nobs(modelo_sem)),
+  Sigma = c(sigma(modelo), sigma(modelo_sem)),
+  R2_adj = c(summary(modelo)$adj.r.squared, summary(modelo_sem)$adj.r.squared)
+)
+```
+
+As maiores variações relativas ocorreram nos coeficientes de `aquecimento_gas` (-19,2%), `entrada_carro` (-16,0%), `area_recreacao` (-15,4%) e `vagas_garagem` (+14,3%). Os coeficientes de `area_lote` (+3,6%) e `ar_condicionado` (+1,0%) praticamente não se alteraram. As maiores variações aparecem justamente em variáveis com poucas casas em um dos níveis: apenas 25 das 546 casas usam gás para aquecimento de água e apenas 77 não possuem entrada para automóveis. Nesses casos, poucas observações têm um peso maior na estimativa do coeficiente.
+
+Apesar dessas variações, nenhum coeficiente mudou de sinal e nenhuma variável mudou de conclusão quanto à significância ao nível de 5%. A variável com maior valor-p, `area_recreacao`, passou de $p = 0{,}016$ para $p = 0{,}036$, permanecendo significativa. Sem as 8 casas, o erro-padrão residual caiu de 0,0940 para 0,0905 e o $R^2$ ajustado subiu de 0,6675 para 0,6778, uma melhora pequena e esperada, já que foram retiradas justamente as casas que o modelo ajustava pior.
+
+Não há evidências de que essas casas sejam erros de registro: os valores de todas as variáveis estão dentro de faixas plausíveis, e o preço de uma casa pode realmente se afastar do esperado por características que não foram medidas no banco de dados, como o estado de conservação do imóvel ou a sua idade. As casas de alavanca, por sua vez, são propriedades de alto padrão legítimas, e retirá-las reduziria a capacidade do modelo de representar imóveis maiores. Como a remoção dessas observações não altera nenhuma conclusão do modelo, optamos por **mantê-las na análise**.
