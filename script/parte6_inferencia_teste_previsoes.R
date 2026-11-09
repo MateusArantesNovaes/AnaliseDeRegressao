@@ -1,5 +1,3 @@
-# PARTE 6: inferencia final, comparacao no teste e previsoes
-# Execute na raiz do projeto do grupo ou nesta pasta separada.
 library(tidymodels)
 library(reglin)
 library(splines2)
@@ -132,5 +130,3 @@ previsoes_cenarios <- data.frame(
 )
 print(previsoes_cenarios[, c("id", "media_cad", "ic_media_inf", "ic_media_sup",
                              "ip_nova_inf", "ip_nova_sup")])
-# Interpretacoes ficam no Quarto. Nenhum arquivo da equipe e sobrescrito.
-
