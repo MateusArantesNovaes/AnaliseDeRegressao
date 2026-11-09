@@ -1,6 +1,5 @@
 # PARTE 6: inferencia final, comparacao no teste e previsoes
 # Execute na raiz do projeto do grupo ou nesta pasta separada.
-if (dir.exists(".r-library")) .libPaths(c(normalizePath(".r-library"), .libPaths()))
 library(tidymodels)
 library(reglin)
 library(splines2)
