@@ -1,0 +1,1543 @@
+---
+title: "Preços de habitações em Windsor"
+subtitle: "Análise de regressão: relatório completo"
+author:
+  - "Ana Carolina Vieira Neves"
+  - "Fernando Thales Santana Lopes"
+  - "Joao Vitor Santos e Silva"
+  - "Mateus Arantes Novaes"
+  - "Raphael Henrique Carvalho de Oliveira"
+lang: pt-BR
+format:
+  typst:
+    papersize: a4
+    fontsize: 10pt
+    margin:
+      x: 2cm
+      y: 2cm
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    keep-typ: true
+    output-file: relatorio_completo_windsor.pdf
+params:
+  pasta_dados: "data"
+  bootstrap: 2000
+execute:
+  echo: false
+  warning: false
+  message: false
+  error: false
+  cache: false
+---
+
+```{r}
+#| label: p6-configuracao
+#| include: false
+# Este arquivo somente LE os arquivos da equipe. As saidas ficam em
+# resultados_parte6/, junto deste documento. Nao executa scripts anteriores.
+if (.Platform$OS.type == "windows") {
+  Sys.setlocale("LC_CTYPE", "Portuguese_Brazil.utf8")
+}
+if (dir.exists(".r-library")) {
+  .libPaths(c(normalizePath(".r-library"), .libPaths()))
+}
+pacotes <- c("tidymodels", "kknn", "splines2", "reglin", "knitr")
+faltantes <- pacotes[!vapply(pacotes, requireNamespace, logical(1), quietly = TRUE)]
+if (length(faltantes)) {
+  stop("Instale os pacotes antes de renderizar: ", paste(faltantes, collapse = ", "))
+}
+library(tidymodels)
+theme_set(theme_minimal(base_size = 11))
+options(width = 85, contrasts = c("contr.treatment", "contr.poly"), knitr.kable.NA = "")
+knitr::opts_chunk$set(fig.width = 7, fig.height = 4.6, dpi = 180)
+
+candidatas <- unique(c(params$pasta_dados, "data", "../AnaliseDeRegressao/data"))
+pastas_ok <- candidatas[file.exists(file.path(candidatas, "dados_preparados.RData"))]
+if (!length(pastas_ok)) {
+  stop("Nao localizei data/dados_preparados.RData. Copie este QMD para a raiz ",
+       "do projeto ou ajuste params$pasta_dados.")
+}
+pasta_dados <- normalizePath(pastas_ok[1])
+ler_objetos <- function(nome) {
+  e <- new.env(parent = globalenv())
+  load(file.path(pasta_dados, nome), envir = e)
+  e
+}
+base <- ler_objetos("dados_preparados.RData")
+p2 <- ler_objetos("parte2_modelos_lineares.RData")
+p3 <- ler_objetos("parte3_multicolinearidade_polinomios.RData")
+split_casas <- base$split_casas
+treino <- training(split_casas)
+dobras <- base$cv_folds
+modelo_final <- p2$modelo_stepwise
+formula_completa <- formula(p2$mod_completo)
+formula_final <- formula(modelo_final)
+preditoras <- all.vars(formula_completa)[-1]
+stopifnot(!"preco" %in% preditoras,
+          identical(as.data.frame(treino), as.data.frame(base$treino_casas)),
+          all(is.finite(treino$preco)), all(treino$preco > 0),
+          isTRUE(all.equal(treino$preco_log, log10(treino$preco))),
+          !anyNA(treino[, c("preco_log", preditoras)]),
+          nobs(modelo_final) == nrow(treino))
+# Refaz o ajuste SOMENTE no treino para conferir a compatibilidade dos RData.
+modelo_conferencia <- lm(formula_final, data = treino)
+stopifnot(isTRUE(all.equal(coef(modelo_conferencia), coef(modelo_final),
+                          tolerance = 1e-8)))
+modelo_final <- modelo_conferencia
+formato <- function(x, casas = 2) {
+  formatC(x, format = "f", digits = casas, big.mark = ".", decimal.mark = ",")
+}
+valor_p <- function(x) {
+  ifelse(x < 0.001, "< 0,001", formato(x, 3))
+}
+tabela <- function(x, ...) knitr::kable(x, format = "pipe", ...)
+```
+
+
+```{r}
+#| label: global-tabelas
+#| include: false
+resumo_modelo <- function(m) {
+  tab <- broom::tidy(m)
+  tab$p.value <- valor_p(tab$p.value)
+  names(tab) <- c("Termo", "Estimativa", "Erro-padrão", "t", "Valor-p")
+  tabela(tab, digits = 5)
+}
+```
+
+{{< pagebreak >}}
+
+# Introdução e preparação dos dados
+
+O objetivo é analisar as características associadas aos preços de venda de
+habitações em Windsor, Canadá, em 1987, e avaliar a capacidade de previsão
+de diferentes modelos de regressão. O preço está em dólares canadenses
+(CAD) e a área do lote em metros quadrados, conforme o enunciado.
+
+O relatório reúne preparação, modelos lineares e seleção, multicolinearidade
+e formas funcionais, diagnósticos de resíduos, influência, inferência final
+e avaliação preditiva. As análises são executadas em R e o documento é
+compilado com Quarto. Os scripts e relatórios originais do grupo são preservados;
+a integração e os ajustes editoriais estão somente nesta nova cópia.
+
+## Variáveis e conferência inicial
+
+```{r}
+#| label: p1-conferencia
+dados_csv <- readr::read_csv(file.path(pasta_dados, "tb-reg-lin-casas.csv"),
+                           show_col_types = FALSE)
+stopifnot(nrow(dados_csv) == nrow(base$dados),
+          !anyNA(dados_csv), all(dados_csv$preco > 0),
+          all(dados_csv$area_lote > 0))
+dicionario <- data.frame(
+  Variavel = c("preco", "area_lote", "quartos", "banheiros", "andares",
+               "entrada_carro", "area_recreacao", "porao", "aquecimento_gas",
+               "ar_condicionado", "vagas_garagem", "area_preferencial"),
+  Descricao = c("Preço de venda em CAD", "Área do terreno em m²",
+    "Número de quartos", "Número de banheiros completos", "Andares, excluindo o porão",
+    "Entrada para automóveis (sim/não)", "Sala de recreação/jogos (sim/não)",
+    "Porão totalmente acabado (sim/não)", "Gás para aquecimento de água (sim/não)",
+    "Ar-condicionado central (sim/não)", "Número de vagas de garagem",
+    "Bairro de alta preferência (sim/não)")
+)
+tabela(dicionario, caption = "Dicionário das variáveis fornecido no enunciado.")
+```
+
+A base contém `r nrow(dados_csv)` casas e `r ncol(dados_csv)` variáveis originais.
+A conferência não encontrou valores ausentes. Valores extremos não são removidos
+automaticamente; sua influência é examinada na Parte 5.
+
+## Transformação, treino e teste
+
+O grupo converteu as seis variáveis binárias em fatores e criou
+`preco_log = log10(preco)`. A divisão original, com semente 123 e estratificação
+pelo preço, reservou `r nrow(treino)` imóveis para treino e
+`r nrow(base$dados) - nrow(treino)` para teste. As dez dobras de validação
+cruzada pertencem exclusivamente ao treino. Carregamos os objetos já salvos,
+sem refazer a divisão nem sobrescrever os arquivos da equipe.
+
+```{r}
+#| label: p1-objetos
+#| echo: true
+treino_casas <- base$treino_casas
+teste_casas <- base$teste_casas
+cv_folds <- base$cv_folds
+```
+
+No procedimento original, o diagnóstico de Box-Cox foi feito antes da divisão,
+com todos os dados. A transformação logarítmica é mantida por compatibilidade,
+mas essa decisão impede caracterizar o teste como completamente independente
+de todas as escolhas analíticas. A Parte 6 explicita essa limitação e mantém
+os ajustes adicionais restritos ao treino.
+
+## Descrição do conjunto de treino
+
+```{r}
+#| label: p1-resumo
+numericas <- c("preco", "area_lote", "quartos", "banheiros", "andares", "vagas_garagem")
+resumo_treino <- do.call(rbind, lapply(numericas, function(v) {
+  x <- treino_casas[[v]]
+  data.frame(Variavel = v, Minimo = min(x), Mediana = median(x),
+             Media = mean(x), Maximo = max(x))
+}))
+tabela(resumo_treino, digits = 2, caption = "Resumo das variáveis numéricas no treino.")
+```
+
+```{r}
+#| label: p1-distribuicoes
+#| fig-cap: "Distribuição do preço no treino: escala original e logaritmo decimal."
+#| fig-height: 3.5
+distribuicoes <- dplyr::bind_rows(
+  data.frame(Escala = "Preço (CAD)", Valor = treino_casas$preco),
+  data.frame(Escala = "log10 do preço", Valor = treino_casas$preco_log))
+ggplot(distribuicoes, aes(Valor)) +
+  geom_histogram(bins = 25, fill = "#225b78", color = "white") +
+  facet_wrap(~Escala, scales = "free", nrow = 1) + labs(x = NULL, y = "Casas")
+```
+
+A transformação reduz a assimetria à direita e muda a interpretação dos
+coeficientes para associações multiplicativas com o preço. Sua adequação é
+examinada com os diagnósticos, não apenas pela aparência do histograma.
+
+
+```{r}
+#| label: p2-setup
+#| include: false
+# Carrega os pacotes necessários
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(reglin)
+library(car)
+library(broom)
+
+# Carrega os dados preparados, incluindo a divisão de treino e teste
+load(file.path(pasta_dados, "dados_preparados.RData"))
+```
+
+# Modelos Lineares Múltiplos e Seleção de Variáveis
+
+Essa etapa tem como objetivo ajustar um modelo linear múltiplo capaz de prever o logaritmo do preço dos imóveis (`preco_log`), avaliando a contribuição de diferentes blocos de características e aplicando métodos de seleção para encontrar o modelo que melhor explica os dados usando o menor número possível de variáveis explicativas.
+
+## Ajuste do Modelo Completo
+
+O primeiro passo consistiu em ajustar um modelo completo que usa todas variáveis preditoras disponíveis no conjunto de treinamento. Esse modelo serve como uma base para compreendermos a capacidade máxima de explicação dos dados antes de fazer qualquer simplificação. A variável resposta utilizada foi o `preco_log` para estabilizar a variância conforme indicado pelo teste de Box-Cox realizado na etapa de preparação.
+
+```{r}
+#| label: p2-modelo-completo
+# Ajuste do modelo linear múltiplo utilizando todas as variáveis disponíveis
+mod_completo <- lm(
+  preco_log ~ area_lote + quartos + banheiros + andares + 
+    entrada_carro + area_recreacao + porao + aquecimento_gas + 
+    ar_condicionado + vagas_garagem + area_preferencial, 
+  data = treino_casas
+)
+
+# Tabela ANOVA (teste F global) e summary
+resumo_modelo(mod_completo)
+invisible(capture.output(tab_anova_p2 <- reglin::tab_anova(mod_completo)))
+tab_anova_p2 <- as.data.frame(tab_anova_p2)
+tab_anova_p2[['Pr(>F)']] <- ifelse(is.na(tab_anova_p2[['Pr(>F)']]), '', valor_p(tab_anova_p2[['Pr(>F)']]))
+tabela(tab_anova_p2, digits = 4)
+```
+
+O modelo completo mostrou-se estatisticamente significativo ($F = 80{,}21$; $p < 0{,}001$). Isso confirma que o conjunto de variáveis selecionadas, nesse caso todas as disponíveis, contribui para explicar o valor das casas. O coeficiente de determinação ajustado ($R^2_{\text{adj}}$) foi de 66,75%, o que pode ser interpretado como a medida de ajuste da variabilidade de log10(preço), corrigida pelo número de parâmetros. Contudo, é válido ressaltar que o $R^2$ não deve ser utilizado de forma indiscriminada para julgar a adequação de um modelo. Além disso, um $R^2$ alto não implica necessariamente que o modelo fornecerá previsões acuradas para observações futuras. É exatamente por isso que, nas etapas seguintes, vamos usar métricas mais robustas para validação e comparação, como o AIC e a estatística PRESS.
+
+## Testes de Somas de Quadrados Extra
+
+Para testar estatísticamente se poderíamos simplificar o modelo removendo categorias inteiras sem perder previsibilidade, aplicamos os testes de Somas de Quadrados Extra. Basicamente, vamos verificar se a exclusão de um bloco de variáveis aumenta significativamente a soma de quadrados dos resíduos (erro) do modelo.
+
+Agrupamos as variáveis em três blocos: características internas da casa, estrutura da casa e vagas de garagem e localização.
+
+**Teste 1: Características Internas**
+```{r}
+#| label: p2-sq-internas
+# Removendo características internas da casa
+mod_sem_internas <- update(mod_completo, . ~ . - quartos - banheiros - 
+                             aquecimento_gas - ar_condicionado)
+anova(mod_sem_internas, mod_completo)
+```
+
+**Teste 2: Estruturas e Vagas**
+```{r}
+#| label: p2-sq-estruturas
+# Removendo características estruturais da casa e vagas na garagem
+mod_sem_estruturas <- update(mod_completo, . ~ . - andares - entrada_carro - 
+                               area_recreacao - porao - vagas_garagem)
+anova(mod_sem_estruturas, mod_completo)
+```
+
+**Teste 3: Localização**
+```{r}
+#| label: p2-sq-localizacao
+# Removendo a variável de área de preferência
+mod_sem_preferencia <- update(mod_completo, . ~ . - area_preferencial)
+anova(mod_sem_preferencia, mod_completo)
+```
+
+A análise dos testes revelou que nenhum dos blocos pode ser descartado. A remoção das características internas aumentou significativamente a soma de quadrados dos resíduos ($F = 27{,}913$; $p < 2{,}2 \times 10^{-16}$). O mesmo ocorreu ao testarmos a remoção das estruturas e vagas ($F = 21{,}785$; $p < 2{,}2 \times 10^{-16}$) e da área de preferência ($F = 19{,}442$; $p = 1{,}317 \times 10^{-5}$). Isso confirma a importância dessas características na precificação dos imóveis.
+
+## Seleção Automática (Stepwise) e Comparação de Modelos
+
+Como os testes anteriores mostraram que todas as categorias possuem importância global, passamos para uma seleção variável a variável utilizando o método **Stepwise**. 
+
+Optamos pela direção **"both"** porque ela é a mais completa, uma vez que, a cada passo, o algoritmo testa tanto a inclusão de uma variável que ficou de fora quanto a exclusão de uma variável que já está no modelo. No entanto, as demais direções também foram testadas, mas não foram apresentadas aqui.
+
+```{r}
+#| label: p2-stepwise-execucao
+# Modelo nulo contendo apenas o intercepto
+mod_nulo <- lm(preco_log ~ 1, data = treino_casas)
+
+# Usamos o algoritmo Stepwise na direção both
+step_both <- stats::step(mod_completo, direction = "both", 
+                         scope = list(lower = mod_nulo, upper = mod_completo), 
+                         trace = FALSE)
+modelo_stepwise <- step_both
+```
+
+Para validar a escolha, comparamos todos os modelos utilizando AIC e PRESS. O AIC "penaliza" o modelo por cada variável extra incluída, evitando que fiquemos adicionando variáveis desnecessárias. Já a estatística PRESS (Prediction Error Sum of Squares) soma os erros quadráticos de validação leave-one-out, mantendo fixa a especificação avaliada; não substitui uma avaliação externa nem incorpora toda a incerteza da seleção. Modelos que apresentam os menores valores de AIC e PRESS são preferíveis, pois indicam menos erros de previsão e maior eficiência.
+
+```{r}
+#| label: p2-comparacao
+# Comparação de Modelos (AIC e PRESS)
+tab_comparativa <- data.frame(
+  Modelo = c("Completo", "Sem Internas", "Sem Estruturas", "Sem Preferência", "Stepwise (Both)"),
+  AIC = c(AIC(mod_completo), AIC(mod_sem_internas), 
+          AIC(mod_sem_estruturas), AIC(mod_sem_preferencia), AIC(step_both)),
+  PRESS = c(reglin::press(mod_completo), reglin::press(mod_sem_internas), 
+            reglin::press(mod_sem_estruturas), reglin::press(mod_sem_preferencia), 
+            reglin::press(step_both)),
+  R2_adj = c(summary(mod_completo)$adj.r.squared, 
+             summary(mod_sem_internas)$adj.r.squared,
+             summary(mod_sem_estruturas)$adj.r.squared, 
+             summary(mod_sem_preferencia)$adj.r.squared,
+             summary(step_both)$adj.r.squared)
+)
+
+tabela(tab_comparativa, digits = 4)
+```
+
+Os resultados do Stepwise convergiram para o modelo completo. O algoritmo determinou que a melhor configuração é manter todas as variáveis preditoras, pois o modelo completo apresentou o menor valor de AIC (-808,41) e a menor estatística PRESS (3,959), quando comparados aos modelos reduzidos que testamos anteriormente.
+
+```{r}
+#| label: p2-modelo-final
+resumo_modelo(modelo_stepwise)
+```
+
+Dessa forma, o modelo linear múltiplo final ficou com as 11 variáveis originais, porque o procedimento Stepwise por AIC não removeu nenhuma delas. Os testes individuais também apresentaram valores-p inferiores a 5%, condicionais à especificação selecionada.
+
+```{r}
+#| label: p3-setup
+#| include: false
+# Carrega os pacotes necessários
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(tidymodels)
+library(reglin)
+library(car)
+library(splines2)
+
+# Carrega os dados preparados e os modelos ajustados
+load(file.path(pasta_dados, "dados_preparados.RData"))
+load(file.path(pasta_dados, "parte2_modelos_lineares.RData"))
+
+modelo <- mod_completo
+n <- nrow(treino_casas)
+```
+
+# Multicolinearidade, Regressão Polinomial, B-Splines e Padronização
+
+Essa etapa tem como objetivo verificar se existe dependência linear entre as variáveis explicativas do modelo completo, investigar a forma funcional da variável `area_lote` (que apresentou curvatura no gráfico de resíduos parciais da Parte 4) e comparar a importância relativa de cada variável sobre o preço das casas por meio de coeficientes padronizados.
+
+## Diagnóstico de Multicolinearidade
+
+A multicolinearidade ocorre quando as variáveis explicativas são fortemente correlacionadas entre si. Nesse caso, a matriz $X^\top X$ se aproxima de uma matriz singular e a variância dos estimadores, dada por $V(\hat{\beta}_j) = \sigma^2 C_{jj}$, com $C = (X^\top X)^{-1}$, fica inflacionada. Isso torna as estimativas instáveis, podendo inclusive inverter o sinal de alguns coeficientes. Para diagnosticar esse problema utilizamos o fator de inflação da variância, $VIF_j = 1/(1 - R^2_j)$, onde $R^2_j$ é o coeficiente de determinação da regressão de $x_j$ sobre as demais variáveis explicativas. Valores de VIF acima de 10 indicam multicolinearidade séria.
+
+```{r}
+#| label: p3-vif
+# VIF de cada variável
+vif_completo <- car::vif(modelo)
+vif_completo
+any(vif_completo > 10)
+```
+
+Todos os valores de VIF ficaram entre 1,05 (`aquecimento_gas`) e 1,49 (`andares`), muito abaixo do limiar de 10. Isso indica que não há evidência de multicolinearidade intensa segundo esse critério; isso não implica ausência de correlações entre covariáveis.
+
+Como todas as variáveis do modelo possuem apenas 1 grau de liberdade, a função `car::vif()` retorna o VIF clássico. Para avaliar o caso de variáveis com mais de dois níveis, ajustamos uma versão do modelo tratando `andares` e `vagas_garagem` como fatores (uma variável com $a$ níveis gera $a-1$ colunas na matriz $X$). Nesse caso, o VIF generalizado (GVIF) deve ser comparado por meio de $GVIF^{1/(2 \cdot Df)}$ com o limiar $\sqrt{10} \approx 3{,}162$.
+
+```{r}
+#| label: p3-gvif
+# GVIF tratando andares e vagas_garagem como fator
+mod_fatores <- update(modelo, . ~ . - andares - vagas_garagem + factor(andares) + factor(vagas_garagem))
+gvif_tab <- car::vif(mod_fatores)
+gvif_tab
+
+# Compara GVIF^(1/(2*Df)) com o limiar sqrt(10)
+gvif_tab[, "GVIF^(1/(2*Df))"] > sqrt(10)
+```
+
+O maior valor de $GVIF^{1/(2 \cdot Df)}$ foi 1,28 (`quartos`), novamente muito abaixo do limiar. Por fim, verificamos numericamente a expressão da variância dos estimadores e calculamos o número de condição da matriz $X$.
+
+```{r}
+#| label: p3-variancia
+# Variância dos estimadores: V(beta_j) = sigma^2 * C_jj
+X <- model.matrix(modelo)
+C <- solve(t(X) %*% X)
+all.equal(sigma(modelo)^2 * diag(C), diag(vcov(modelo)))
+
+# Número de condição da matriz X
+kappa(X, exact = TRUE)
+```
+
+O número de condição de 2761 não se deve à multicolinearidade, e sim à diferença de escala entre as colunas de $X$: a `area_lote` assume valores na casa das centenas de metros quadrados, enquanto as variáveis indicadoras assumem apenas 0 ou 1. Os VIFs, que não dependem da escala, não apontam multicolinearidade intensa no modelo completo.
+
+## Regressão Polinomial em `area_lote`
+
+Na Parte 4, o gráfico de resíduos parciais da variável `area_lote` mostrou uma curvatura, indicando que a relação com o `preco_log` não é estritamente linear. Para investigar isso, primeiro incluímos um termo quadrático no modelo.
+
+```{r}
+#| label: p3-quadratico
+# Termo quadrático em area_lote
+mod_quad <- update(modelo, . ~ . + I(area_lote^2))
+resumo_modelo(mod_quad)
+anova(modelo, mod_quad)
+```
+
+O termo quadrático foi significativo ($F = 11{,}254$; $p = 0{,}00087$) e possui coeficiente negativo, o que indica que o preço cresce com o tamanho do lote, mas a uma taxa decrescente. Em seguida, ajustamos polinômios de grau 1 a 6 em `area_lote`, mantendo as demais variáveis. Utilizamos `poly(..., raw = TRUE)` para que os coeficientes correspondam diretamente às potências de `area_lote`, preservando a interpretação. Para cada grau, calculamos o AIC, a estatística PRESS, o $R^2$ ajustado, o determinante de $X^\top X$ e o número de condição de $X$.
+
+```{r}
+#| label: p3-graus
+# Modelos de grau 1 a 6
+mod_grau1 <- modelo
+mod_grau2 <- update(modelo, . ~ . - area_lote + poly(area_lote, degree = 2, raw = TRUE))
+mod_grau3 <- update(modelo, . ~ . - area_lote + poly(area_lote, degree = 3, raw = TRUE))
+mod_grau4 <- update(modelo, . ~ . - area_lote + poly(area_lote, degree = 4, raw = TRUE))
+mod_grau5 <- update(modelo, . ~ . - area_lote + poly(area_lote, degree = 5, raw = TRUE))
+mod_grau6 <- update(modelo, . ~ . - area_lote + poly(area_lote, degree = 6, raw = TRUE))
+
+modelos_grau <- list(mod_grau1, mod_grau2, mod_grau3, mod_grau4, mod_grau5, mod_grau6)
+
+# Tabela de sensibilidade do grau
+tab_grau <- data.frame(
+  Grau = 1:6,
+  AIC = sapply(modelos_grau, AIC),
+  PRESS = sapply(modelos_grau, reglin::press),
+  R2_adj = sapply(modelos_grau, function(m) summary(m)$adj.r.squared),
+  Det_XtX = sapply(modelos_grau, function(m) det(crossprod(model.matrix(m)))),
+  Kappa = sapply(modelos_grau, function(m) kappa(model.matrix(m), exact = TRUE))
+)
+
+tabela(tab_grau, digits = 4)
+
+# Teste sequencial entre os graus
+anova(mod_grau1, mod_grau2, mod_grau3, mod_grau4)
+```
+
+O polinômio de grau 3 apresentou simultaneamente o menor AIC (-826,55) e a menor estatística PRESS (3,799). A partir do grau 4, os dois critérios voltam a piorar, sinal de que os termos extras passam a ajustar ruído (sobreajuste). O teste sequencial de somas de quadrados extra confirma esse resultado: os termos de grau 2 ($p = 0{,}0008$) e 3 ($p = 0{,}0013$) são significativos, enquanto o de grau 4 não é ($p = 0{,}81$).
+
+A tabela também mostra o mal condicionamento da matriz à medida que o grau aumenta. O número de condição de $X$ cresce de $2{,}8 \times 10^{3}$ no grau 1 para $6{,}0 \times 10^{19}$ no grau 6. A partir do grau 5 ele ultrapassa $1/\varepsilon \approx 4{,}5 \times 10^{15}$ (o inverso da precisão numérica do computador), ou seja, as estimativas desses modelos ficam numericamente pouco confiáveis. Já o determinante de $X^\top X$ cresce em vez de se aproximar de zero, porque depende da escala das colunas ($area\_lote^6$ é da ordem de $10^{18}$). Por isso, nesse caso, o número de condição é o indicador mais adequado.
+
+O uso de potências não centralizadas também gera multicolinearidade estrutural, já que `area_lote` e `area_lote^2` são fortemente correlacionadas.
+
+```{r}
+#| label: p3-vif-polinomio
+# Correlação entre area_lote e area_lote^2
+car::vif(mod_quad)
+cor(treino_casas$area_lote, treino_casas$area_lote^2)
+
+# Centralizando area_lote para reduzir essa correlação
+treino_casas <- treino_casas %>% mutate(area_c = area_lote - mean(area_lote))
+mod_quad_c <- update(modelo, . ~ . - area_lote + area_c + I(area_c^2), data = treino_casas)
+car::vif(mod_quad_c)
+```
+
+No modelo quadrático, a correlação entre `area_lote` e `area_lote^2` é de 0,959, e os VIFs desses dois termos sobem para 15,1 e 13,8. Ao centralizar a variável em torno da média, os VIFs caem para 2,15 e 1,69, sem alterar os valores ajustados do modelo. Isso mostra que essa multicolinearidade é apenas consequência da forma como o polinômio foi construído, e não um problema dos dados.
+
+Como alternativa ao polinômio, também testamos a transformação logarítmica de `area_lote`, que captura o crescimento a taxa decrescente com um único parâmetro.
+
+```{r}
+#| label: p3-log-area
+# Transformação logarítmica em area_lote
+mod_logarea <- update(modelo, . ~ . - area_lote + log10(area_lote))
+resumo_modelo(mod_logarea)
+```
+
+Com a transformação, o coeficiente de `log10(area_lote)` foi de 0,317 ($p < 0{,}001$). Como o preço também está em escala logarítmica, esse coeficiente pode ser interpretado como uma elasticidade: mantidas as demais características, um aumento de 1% no tamanho do lote está associado a um aumento de aproximadamente 0,32% no preço da casa.
+
+Por fim, selecionamos o grau com menor PRESS e verificamos novamente o gráfico de resíduos parciais. Como a função `reglin::ggresiduals(type = "crPlots")` não aceita termos com `poly()` ou `I()`, utilizamos a função `car::crPlots()`.
+
+```{r}
+#| label: p3-crplot-polinomio
+#| fig-height: 6
+# Escolhe o grau com menor PRESS
+grau_otimo <- which.min(tab_grau$PRESS)
+modelo_polinomial <- modelos_grau[[grau_otimo]]
+resumo_modelo(modelo_polinomial)
+
+car::crPlots(modelo_polinomial, layout = c(3, 4), ask = FALSE)
+```
+
+Após o ajuste do polinômio de grau 3, a linha suavizada dos resíduos parciais acompanha a reta do componente ajustado, indicando que a curvatura observada na Parte 4 foi corrigida.
+
+## B-Splines Cúbicos com Validação Cruzada
+
+Uma alternativa mais flexível aos polinômios são os B-splines cúbicos, que dividem o intervalo de `area_lote` em partes (separadas por nós) e ajustam um polinômio cúbico em cada uma delas. O número de graus de liberdade (`deg_free`) controla a quantidade de nós e, portanto, a flexibilidade da curva. Para escolher esse valor sem sobreajuste, utilizamos os 10 lotes de validação cruzada criados na Parte 1 dentro do ecossistema `tidymodels`, testando de 3 a 12 graus de liberdade.
+
+```{r}
+#| label: p3-splines-cv
+receita_spline <- recipe(
+  preco_log ~ area_lote + quartos + banheiros + andares + entrada_carro +
+    area_recreacao + porao + aquecimento_gas + ar_condicionado +
+    vagas_garagem + area_preferencial,
+  data = treino_casas
+) %>%
+  step_spline_b(area_lote, deg_free = tune(), degree = 3) %>%
+  step_dummy(all_nominal_predictors())
+
+wf_spline <- workflow() %>%
+  add_recipe(receita_spline) %>%
+  add_model(linear_reg() %>% set_engine("lm"))
+
+# Testa de 3 a 12 graus de liberdade nos 10 folds
+set.seed(123)
+tune_spline <- tune_grid(
+  wf_spline,
+  resamples = cv_folds,
+  grid = data.frame(deg_free = 3:12),
+  metrics = metric_set(rmse, rsq)
+)
+
+autoplot(tune_spline)
+show_best(tune_spline, metric = "rmse")
+
+# Escolhe o modelo mais simples dentro de 1 erro-padrão do melhor
+melhor_df <- select_by_one_std_err(tune_spline, deg_free, metric = "rmse")
+melhor_df
+```
+
+O menor RMSE médio na validação cruzada foi obtido com 3 graus de liberdade (RMSE = 0,0934), e o critério de 1 erro-padrão também escolheu esse valor. Aumentar a flexibilidade da curva não melhorou a capacidade preditiva. O aviso exibido durante a validação cruzada ocorre porque, em alguns lotes, a parte de validação contém casas com `area_lote` fora do intervalo observado na parte de treino, o que exige extrapolar a curva.
+
+```{r}
+#| label: p3-splines-final
+wf_spline_final <- finalize_workflow(wf_spline, melhor_df)
+fit_spline_tm <- fit(wf_spline_final, data = treino_casas)
+
+# Ajusta o mesmo modelo com lm para comparar com os demais
+df_spline <- melhor_df$deg_free
+modelo_spline <- update(modelo, . ~ . - area_lote + bSpline(area_lote, df = df_spline, degree = 3))
+resumo_modelo(modelo_spline)
+```
+
+É importante notar que um B-spline cúbico com 3 graus de liberdade não possui nós internos, ou seja, é um único polinômio cúbico em todo o intervalo de `area_lote`. Por isso, o modelo de splines escolhido é equivalente ao polinômio de grau 3: os coeficientes da base são diferentes, mas os valores ajustados, os resíduos, o $R^2$ e o AIC são exatamente os mesmos. Assim, a validação cruzada corrobora, com outro critério aplicado ao mesmo treino, o grau 3 escolhido pelo AIC e pelo PRESS.
+
+```{r}
+#| label: p3-comparacao-area
+# Comparação dos tratamentos de area_lote
+tab_area <- data.frame(
+  Modelo = c("Linear", "Polinomial", "Log de area_lote", "B-Spline"),
+  AIC = c(AIC(modelo), AIC(modelo_polinomial), AIC(mod_logarea), AIC(modelo_spline)),
+  PRESS = c(reglin::press(modelo), reglin::press(modelo_polinomial),
+            reglin::press(mod_logarea), reglin::press(modelo_spline)),
+  R2_adj = c(summary(modelo)$adj.r.squared, summary(modelo_polinomial)$adj.r.squared,
+             summary(mod_logarea)$adj.r.squared, summary(modelo_spline)$adj.r.squared)
+)
+
+tabela(tab_area, digits = 4)
+```
+
+Todos os tratamentos não lineares melhoram o modelo linear original. O polinômio de grau 3 (e o B-spline equivalente) apresentou os melhores valores de AIC e PRESS, mas o modelo com `log10(area_lote)` ficou muito próximo (diferença de 1,5 no AIC e de 0,014 no PRESS) utilizando dois parâmetros a menos e com uma interpretação mais simples. Essas alternativas documentam a sensibilidade à forma funcional. A comparação final solicitada na Parte 6 apresenta Linear, Stepwise, B-Spline e KNN; o modelo log-área permanece como análise exploratória do treino.
+
+## Padronização de Variáveis
+
+Os coeficientes do modelo de regressão dependem das unidades de medida das variáveis, o que impede compará-los diretamente para saber qual variável tem maior influência sobre o preço. Para resolver isso, padronizamos as variáveis de duas formas, utilizando a função `reglin::standardization()`:
+
+- **Escala normal unitária:** $z_{ij} = (x_{ij} - \bar{x}_j)/s_j$, de modo que cada variável tenha média 0 e variância 1;
+- **Comprimento unitário:** $w_{ij} = (x_{ij} - \bar{x}_j)/\sqrt{S_{jj}}$, com $S_{jj} = \sum_i (x_{ij} - \bar{x}_j)^2$, de modo que cada coluna tenha média 0 e comprimento 1.
+
+Como as variáveis padronizadas são centradas, os modelos são ajustados sem intercepto. As variáveis indicadoras entram com seus valores 0 e 1.
+
+```{r}
+#| label: p3-padronizacao
+# Matriz das covariáveis sem o intercepto
+Xs <- model.matrix(modelo)[, -1]
+y <- treino_casas$preco_log
+
+# Escala normal unitária (Z) e comprimento unitário (W)
+Z <- apply(Xs, 2, standardization, type = "normal")
+W <- apply(Xs, 2, standardization, type = "length")
+yZ <- standardization(y, type = "normal")
+yW <- standardization(y, type = "length")
+
+# Modelos padronizados sem intercepto
+mod_pad_normal <- lm(yZ ~ 0 + Z)
+mod_pad_length <- lm(yW ~ 0 + W)
+
+coef(mod_pad_normal)
+coef(mod_pad_length)
+
+# Verifica que (n - 1) W'W = Z'Z
+all.equal((n - 1) * crossprod(W), crossprod(Z))
+```
+
+As duas formas de padronização produzem exatamente os mesmos coeficientes padronizados, como esperado pela teoria, e a relação $(n-1)W^\top W = Z^\top Z$ foi confirmada numericamente. Vale lembrar que $W^\top W$ é a matriz de correlação das variáveis explicativas, e os elementos da diagonal da sua inversa são justamente os VIFs calculados na seção 3.1.
+
+```{r}
+#| label: p3-ranking
+# Ranking da importância das variáveis
+b_pad <- coef(mod_pad_normal)
+names(b_pad) <- colnames(Xs)
+
+ranking <- data.frame(Variavel = names(b_pad), Coef_Padronizado = b_pad) %>%
+  arrange(desc(abs(Coef_Padronizado)))
+
+tabela(ranking, digits = 4)
+
+ggplot(ranking, aes(x = reorder(Variavel, abs(Coef_Padronizado)), y = Coef_Padronizado)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL, y = "Coeficiente padronizado")
+```
+
+O tamanho do lote é a variável com maior efeito sobre o preço (coeficiente padronizado de 0,301): um aumento de um desvio-padrão em `area_lote` está associado a um aumento de 0,30 desvio-padrão no `preco_log`, mantidas as demais variáveis constantes. Em seguida aparecem o número de andares (0,228), a presença de ar-condicionado central (0,206) e o número de banheiros (0,192). As variáveis com menor efeito relativo são o número de quartos (0,094) e a presença de sala de recreação (0,074), sendo esta última a única com significância apenas marginal no modelo polinomial ($p = 0{,}069$). Todos os coeficientes padronizados são positivos, ou seja, cada característica avaliada está associada a um aumento no valor de venda das casas.
+
+```{r}
+#| label: p4-setup
+#| include: false
+#Bibliotecas
+library(reglin)
+library(car)
+
+# Carrega os dados preparados e os modelos ajustados
+load(file.path(pasta_dados, "dados_preparados.RData"))
+load(file.path(pasta_dados, "parte2_modelos_lineares.RData"))
+
+# Define os modelos 
+modelo <- modelo_stepwise
+modelo_original <- update(modelo, preco ~ .)
+modelo_log <- modelo
+```
+
+# Diagnóstico e Adequação de Resíduos
+
+Essa parte tem como objetivo analisar se o modelo ajustado da regressão múltipla atende as suposições de linearidade e independência dos erros.
+
+## Tipos de Resíduos
+Para avaliar a adequação do modelo foram calculados três tipos de resíduos: ordinários, estudentizados internamente e estudentizados externamente.
+
+### Resíduos Ordinários
+Os resíduos ordinários ($e_i$) correspondem à diferença entre os valores observados da variável resposta ($y_i$) e os valores ajustados pelo modelo ($\hat{y}_i$): 
+$$e_i = y_i - \hat{y}_i, \quad i = 1, \dots, n$$
+
+```{r}
+#| label: p4-bloco-2
+residuos <- residuals(modelo)
+summary(residuos)
+```
+
+Os resultados sugerem que os resíduos ordinários estão centralizados em torno de zero, conforme esperado.
+
+### Resíduos Estudentizados Internamente
+Para corrigir a variação na variância dos resíduos ordinários causada pela alavancagem $h_{ii}$, cada resíduo é dividido pelo seu desvio padrão estimado utilizando o Quadrado Médio dos Resíduos (QMRes) de todo o modelo ajustado:
+$$r_i = \frac{e_i}{\sqrt{\text{QMRes}(1 - h_{ii})}}$$
+
+```{r}
+#| label: p4-bloco-3
+residuos_ei <- rstandard(modelo)
+summary(residuos_ei)
+```
+
+Os resíduos estudentizados internamente apresentaram valores extremos próximos a -3 e 3. Considerando que valores absolutos superiores a 3 podem indicar observações com comportamento atípico, esses resultados apontam a existência de possíveis casos que merecem atenção.
+
+### Resíduos Estudentizados Externamente
+Para evitar que a própria $i$-ésima observação atípica distorça a estimativa da variância residual ($\sigma^2$), calcula-se a variância residual $S_{(i)}^2$ retirando a $i$-ésima observação do ajuste do modelo. O resíduo estudentizado externamente é dado por:
+$$t_i = \frac{e_i}{S_{(i)}\sqrt{1 - h_{ii}}} = r_i \left( \frac{n - p - 1}{n - p - r_i^2} \right)^{1/2}$$
+
+```{r}
+#| label: p4-bloco-4
+residuos_ee <- rstudent(modelo)
+summary(residuos_ee)
+```
+
+Os resíduos estudentizados externamente apresentaram amplitude semelhante aos internamente estudentizados, indicando a existência de possíveis observações atípicas, cuja influência sobre o ajuste do modelo deverá ser investigada por meio de análises complementares de diagnósticos de influência.
+
+## Análise dos Resíduos
+Para complementar a análise descritiva dos resíduos, foram utilizados os gráficos diagnósticos da função ggresiduals(), disponibilizada pelo pacote reglin, e os testes estatístico disponibilizados pela função testResiduals(). Essa análise tem como objetivo verificar se os pressupostos do modelo de regressão linear múltipla são razoavelmente atendidos, especialmente em relação à normalidade dos resíduos, à homocedasticidade e à presença de observações atípicas.
+
+### Análise dos Gráficos Diagnósticos
+
+```{r}
+#| label: p4-bloco-5
+ggresiduals(modelo)
+```
+
+O gráfico a seguir apresenta os gráficos diagnósticos do modelo ajustado com a variável resposta transformada em logaritmo (preco_log).
+
+No gráfico Resíduos versus Valores Ajustados, os resíduos apresentam distribuição aleatória em torno de zero, indicando que a relação entre as variáveis explicativas e a variável resposta está adequadamente representada pelo modelo.
+
+No gráfico Normal Q-Q, os resíduos apresentaram pequenos desvios nas extremidades, sugerindo possíveis desvios de normalidade.
+
+No gráfico Scale-Location, os resíduos apresentam dispersão aproxidamente constante ao longo dos valores ajustados, com alguns poucos outliers, indicando homocedasticidade.
+
+Por fim, o gráfico de ResÍduos vs Alavancagem auxilia na identificação de observações que podem exercer influência sobre o ajuste do modelo. O gráfico sugere a existência de observações que podem merecer investigação adicional, cuja análise detalhada de influência é desenvolvida em outra etapa do projeto.
+
+### Testes Estatísticos dos Resíduos
+Além da avaliação gráfica, foram realizados testes estatísticos para verificar formalmente alguns pressupostos do modelo. Os resultados obtidos para o modelo com a variável resposta transformada em logaritmo são apresentados a seguir.
+
+```{r}
+#| label: p4-bloco-6
+testResiduals(modelo)
+```
+
+#### Normalidade dos resíduos - Teste de Shapiro-Wilk
+O teste de Shapiro-Wilk apresentou estatística W = 0,9909 e p-valor = 0,008944. Considerando o nível de significância de 5%, rejeita-se a hipótese nula de normalidade, indicando evidências estatísticas de que os resíduos não seguem uma distribuição normal, o que também foi indicado pelo gráfico. 
+
+#### Homocedasticidade - Teste de variância não constante
+O teste de variância não constante apresentou estatística qui-quadrado = 0,677467 e p-valor = 0,41046. Como o p-valor é superior a 0,05, não se rejeita a hipótese nula de variância constante dos erros. Dessa forma, não foram encontradas evidências estatísticas de heterocedasticidade.
+
+```{r}
+#| label: p4-dw-ordem
+#| include: false
+set.seed(404)
+dw_permutado <- replicate(1000, {
+  e <- sample(residuals(modelo))
+  sum(diff(e)^2) / sum(e^2)
+})
+```
+
+#### Independência dos resíduos - Teste de Durbin-Watson
+O teste de Durbin-Watson apresentou estatística DW = 1,1923 e valor-p aproximadamente igual a zero. Esse resultado indica evidências de autocorrelação positiva entre os resíduos, sugerindo possível violação do pressuposto de independência dos erros.
+
+É importante notar que o teste de Durbin-Watson é utilizado para séries temporais, sendo sua aplicação em dados com "organização" transversal limitada, uma vez que o resultado pode ser influenciado pela ordem das observações. Para verificar a sensibilidade à ordem, foram feitos 1.000 embaralhamentos dos resíduos, com média da estatística DW de `r formato(mean(dw_permutado), 4)`. Essa checagem não prova independência dos erros. Esse resultado sugere que a autocorrelação identificada na ordem original pode estar relacionada à disposição dos dados, não sendo possível concluir, apenas com esse teste, pela existência de dependência entre os erros do modelo.
+
+#### Identificação de observações atípicas - Teste de Bonferroni
+Por fim, o teste de Bonferroni não identificou resíduos estudentizados significativamente discrepantes, considerando o nível de significância de 5%.
+
+### Conclusões
+O teste de variância não constante não apontou evidências de heterocedasticidade, e o teste de Bonferroni não identificou outliers significativos. O resultado do teste de Durbin-Watson merece atenção, mas sua interpretação é limitada pela natureza transversal dos dados e pela ordem das observações.
+
+Assim, considerando os diagnósticos realizados, o modelo transformado apresenta adequação razoável aos pressupostos avaliados, com ressalva quanto à normalidade dos resíduos e à autocorrelação indicada pelo teste de Durbin-Watson.
+
+## Gráficos de Regressão Parcial
+Foram utilizados os gráficos Added-variable plots (avPlots) para avaliar a contribuição parcial das variáveis explicativas, controlando os efeitos das demais variáveis do modelo e os gráficos Component-plus-residual plots (crPlots) com o objetivo de avaliar a adequação da forma funcional linear. 
+
+### Gráficos avPlots
+
+```{r}
+#| label: p4-imagem-Rplot-01-jpeg
+#| fig-height: 6
+#| fig-cap: "Gráficos de regressão adicionada (avPlots)."
+car::avPlots(modelo, layout = c(3, 4), ask = FALSE)
+```
+
+Todos os gráficos apresentados acima exibem uma tendência positiva, embora com diferentes graus de inclinação, indicando que as variáveis explicativas apresentam associação parcial positiva com o preço.
+
+É interessante notar que as variáveis categóricas binárias assumem originalmente os valores 0 e 1, correspondentes a "não" e "sim", respectivamente. Entretanto, nos gráficos avPlots, os valores representados não se restringem necessariamente a esses dois pontos, uma vez que refletem os resíduos das variáveis após o controle pelas demais variáveis explicativas do modelo.
+
+### Gráficos crPlots
+
+```{r}
+#| label: p4-imagem-Rplot-jpeg
+#| fig-height: 6
+#| fig-cap: "Gráficos de resíduos parciais (crPlots)."
+car::crPlots(modelo, layout = c(3, 4), ask = FALSE)
+```
+
+Na imagem apresentada acima, a grande maioria dos gráficos das variáveis contínuas apresenta uma proximidade satisfatória entre a linha do componente linear e a curva suavizada, indicando adequação da especificação linear.A única exceção ocorre na variável area_lote, cuja curva suavizada exibe uma curvatura acentuada em relação à reta do componente linear, evidenciando que a relação não é estritamente linear e justificando a necessidade de correções por meio de termos polinomiais ou splines.
+
+#### Adequação de area_lote
+Para "corrigir" a não-linearidade apresentada no gráfico de resíduos parciais da variável explicativa area_lote, o modelo foi reajustado com regressão polinomial e o comportamento dos resultados parciais foi avaliado novamente.
+
+```{r}
+#| label: p4-bloco-7
+modelo_area_lote_corrigido <- update(modelo, . ~ . - area_lote + poly(area_lote, degree = 2, raw = FALSE))
+
+car::crPlots(modelo_area_lote_corrigido, terms = ~ poly(area_lote, degree = 2, raw = FALSE))
+
+```
+
+Após o ajuste com regressão polinomial é possível observar o alinhamento entre a linha teórica do modelo e a linha suavizada dos resíduos parciais, o que mostra que a inadequação estrutural da variável foi atenuada no diagnóstico gráfico.
+
+## Comparação entre Variável Resposta Original e Transformada
+
+Foram comparados dois modelos com as mesmas variáveis explicativas e observações, diferenciando-se apenas pela variável resposta: o preço original (preco) e o logaritmo do preço (preco_log).
+
+### Modelo Original
+
+```{r}
+#| label: p4-bloco-8
+ggresiduals(modelo_original)
+```
+
+```{r}
+#| label: p4-bloco-9
+testResiduals(modelo_original)
+```
+
+### Modelo Transformado
+
+```{r}
+#| label: p4-bloco-10
+ggresiduals(modelo_log)
+```
+
+```{r}
+#| label: p4-bloco-11
+testResiduals(modelo_log)
+```
+
+### Comparação
+A transformação logarítmica proporcionou melhora na adequação dos resíduos. No modelo original, o teste de Shapiro-Wilk apresentou W = 0,9621 e p-valor = 3,753 × 10^-9, enquanto no modelo transformado apresentou W = 0,9909 e p-valor = 0,008944. Apesar da melhora, a hipótese de normalidade continuou sendo rejeitada.
+
+A principal melhora ocorreu na homocedasticidade. O modelo original apresentou evidências de variância não constante, com p-valor inferior a 2,22 × 10^-16. Já o modelo transformado apresentou p-valor igual a 0,41046, não havendo evidências estatísticas de heterocedasticidade.
+
+Em relação aos valores discrepantes, o modelo original apresentou duas observações identificadas pelo teste de Bonferroni (380 e 332), enquanto o modelo transformado não apresentou observações significativamente discrepantes.
+
+O teste de Durbin-Watson indicou autocorrelação positiva nos dois modelos, sendo necessária cautela na interpretação devido à natureza transversal dos dados.
+
+## Mínimos Quadrados Ponderados
+Considerando que o modelo com resposta transformada não apresentou evidências estatísticas de heterocedasticidade, não foi considerada necessária a aplicação de mínimos quadrados ponderados (WLS).
+
+Assim, a transformação logarítmica foi mantida por proporcionar melhora significativa na homocedasticidade e aproximação dos resíduos à normalidade, embora o pressuposto de normalidade não tenha sido plenamente atendido pelo teste de Shapiro-Wilk.
+
+```{r}
+#| label: p5-setup
+#| include: false
+# Carrega os pacotes necessários
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(reglin)
+library(car)
+
+# Carrega os dados preparados e os modelos ajustados
+load(file.path(pasta_dados, "dados_preparados.RData"))
+load(file.path(pasta_dados, "parte2_modelos_lineares.RData"))
+
+# Mesmo modelo usado na análise de resíduos (Parte 4)
+modelo <- modelo_stepwise
+n <- nobs(modelo)
+p <- length(coef(modelo))
+```
+
+# Alavancagem, Outliers, Medidas de Influência e Sensibilidade
+
+Essa etapa tem como objetivo identificar casas que, sozinhas, exercem uma influência desproporcional sobre o modelo ajustado, seja por possuírem características muito diferentes das demais (pontos de alavanca), seja por terem um preço muito diferente do previsto pelo modelo (outliers). Em seguida, avaliamos o quanto as conclusões do modelo mudam quando essas casas são retiradas da análise. Utilizamos o mesmo modelo analisado na Parte 4, ajustado com as 11 variáveis explicativas e com o `preco_log` como variável resposta, contendo $n = 435$ casas do conjunto de treino e $p = 12$ parâmetros.
+
+## Medidas de Influência
+
+Para cada observação $i$ calculamos as seguintes medidas:
+
+- **Alavancagem ($h_{ii}$):** elemento da diagonal da matriz chapéu $H = X(X^\top X)^{-1}X^\top$. Mede o quão distante a casa está das demais no espaço das variáveis explicativas, sem depender do preço;
+- **DFBETAS:** variação padronizada de cada coeficiente $\hat{\beta}_j$ quando a observação $i$ é retirada do ajuste;
+- **DFFITS:** variação padronizada do valor ajustado $\hat{y}_i$ quando a observação $i$ é retirada do ajuste;
+- **Distância de Cook ($D_i$):** medida global da variação em todos os valores ajustados quando a observação $i$ é retirada;
+- **COVRATIO:** razão entre os determinantes da matriz de covariância dos estimadores sem e com a observação $i$. Valores maiores que 1 indicam que a observação aumenta a precisão das estimativas, e valores menores que 1 indicam que ela reduz a precisão.
+
+```{r}
+#| label: p5-medidas
+infl <- influence.measures(modelo)
+idx_influentes <- which(apply(infl$is.inf, 1, any))
+tab_influentes <- data.frame(
+  Obs = seq_len(nobs(modelo)), Alavancagem = hatvalues(modelo),
+  DFBETAS_max = apply(abs(dfbetas(modelo)), 1, max),
+  DFFITS = dffits(modelo), Cook = cooks.distance(modelo), COVRATIO = covratio(modelo))
+tabela(tab_influentes[idx_influentes, ], digits = 4, row.names = FALSE)
+
+h <- hatvalues(modelo)
+dfb <- dfbetas(modelo)
+dff <- dffits(modelo)
+cook <- cooks.distance(modelo)
+covr <- covratio(modelo)
+```
+
+Por padrão, a função `influence.measures()` marca 33 casas como potencialmente influentes, a maioria delas apenas pelo critério do COVRATIO. Como os critérios padrão do R são bastante sensíveis, utilizamos a seguir os limiares críticos adotados na disciplina.
+
+## Análise Gráfica com os Limiares Críticos
+
+Seguindo os critérios de Cordeiro & Demétrio (2008), que são os mesmos utilizados nos gráficos da função `reglin::gginfluence()`, uma observação é considerada:
+
+- **Ponto de alavanca**, se $h_{ii} > 3p/n$;
+- **Influente nos coeficientes**, se $|DFBETAS_{j(i)}| > 1$;
+- **Influente no valor ajustado**, se $|DFFITS_{(i)}| > 3\sqrt{p/(n-p)}$;
+- **Influente globalmente**, se $D_{(i)} > F_{0{,}5;\,p,\,n-p}$;
+- **Influente na precisão**, se $|1 - COVRATIO_{(i)}| > 3p/(n-p)$.
+
+```{r}
+#| label: p5-limiares
+limiares <- c(
+  leverage = 3 * p / n,
+  dfbetas = 1,
+  dffits = 3 * sqrt(p / (n - p)),
+  cooksd = qf(0.5, p, n - p),
+  covratio = 3 * p / (n - p)
+)
+limiares
+```
+
+```{r}
+#| label: p5-influencia-leverage
+#| fig-height: 3.1
+#| fig-cap: "Diagnóstico de influência: alavancagem."
+gginfluence(modelo, measure = "leverage")
+```
+
+```{r}
+#| label: p5-influencia-dfbetas
+#| fig-height: 5.5
+#| fig-cap: "Diagnóstico de influência: DFBETAS."
+gginfluence(modelo, measure = "dfbetas")
+```
+
+```{r}
+#| label: p5-influencia-cooksd
+#| fig-height: 3.1
+#| fig-cap: "Diagnóstico de influência: distância de Cook."
+gginfluence(modelo, measure = "cooksd")
+```
+
+```{r}
+#| label: p5-influencia-dffits
+#| fig-height: 3.1
+#| fig-cap: "Diagnóstico de influência: DFFITS."
+gginfluence(modelo, measure = "dffits")
+```
+
+```{r}
+#| label: p5-influencia-covratio
+#| fig-height: 3.1
+#| fig-cap: "Diagnóstico de influência: COVRATIO."
+gginfluence(modelo, measure = "covratio")
+```
+
+```{r}
+#| label: p5-marcacoes
+# Marca as observações que passam de cada limiar
+diagnostico <- data.frame(
+  obs = 1:n,
+  preco = treino_casas$preco,
+  area_lote = treino_casas$area_lote,
+  alavanca = h > limiares["leverage"],
+  dfbetas = apply(abs(dfb), 1, max) > limiares["dfbetas"],
+  dffits = abs(dff) > limiares["dffits"],
+  cook = cook > limiares["cooksd"],
+  covratio = abs(1 - covr) > limiares["covratio"]
+)
+diagnostico$n_criterios <- rowSums(diagnostico[, c("alavanca", "dfbetas", "dffits", "cook", "covratio")])
+
+# Quantidade de casas marcadas por critério
+colSums(diagnostico[, c("alavanca", "dfbetas", "dffits", "cook", "covratio")])
+```
+
+Os gráficos e a contagem acima mostram que:
+
+- **Distância de Cook:** nenhuma casa ultrapassou o limiar de 0,947. O maior valor observado foi de aproximadamente 0,04, ou seja, nenhuma observação altera de forma relevante o ajuste como um todo;
+- **DFBETAS:** nenhuma casa ultrapassou o limiar de 1 em nenhum dos 12 coeficientes. Os maiores valores, em torno de 0,5, ocorreram no coeficiente de `aquecimento_gas`, característica presente em apenas 25 das 546 casas do banco de dados;
+- **Alavancagem:** 3 casas ultrapassaram o limiar de 0,083;
+- **DFFITS:** 8 casas ultrapassaram o limiar de 0,505;
+- **COVRATIO:** 30 casas ultrapassaram o limiar de 0,085, sendo o critério que mais marcou observações.
+
+Para verificar a presença de outliers na resposta, aplicamos também o teste de Bonferroni, que avalia o maior resíduo estudentizado externamente comparando-o com a distribuição $t_{n-p-1}$ e corrigindo o nível de significância pelo número de observações.
+
+```{r}
+#| label: p5-bonferroni
+car::outlierTest(modelo)
+```
+
+O maior resíduo estudentizado em valor absoluto foi de -3,20 (observação 77). Após a correção de Bonferroni, o valor-p foi de 0,636, de modo que o teste não identificou outliers na resposta ao nível de 5%.
+
+Para focar nas casas mais atípicas, selecionamos aquelas marcadas por pelo menos dois critérios ao mesmo tempo. A numeração das observações se refere à posição da casa no conjunto de treino.
+
+```{r}
+#| label: p5-atipicas
+atipicas <- diagnostico %>%
+  filter(n_criterios >= 2) %>%
+  arrange(desc(n_criterios))
+atipicas
+
+# Características dessas casas
+treino_casas[atipicas$obs, ]
+summary(treino_casas[, c("preco", "area_lote", "quartos", "banheiros", "andares", "vagas_garagem")])
+```
+
+Oito casas foram marcadas por dois critérios, e elas se dividem em dois grupos bem distintos:
+
+**Pontos de alavanca bem ajustados (observações 360, 371 e 373).** São casas com características extremas, mas cujo preço é coerente com o previsto pelo modelo. A observação 373 possui o maior lote de todo o banco de dados (1505 m², mais de três vezes a mediana de 427 m²), além de 5 quartos e 3 banheiros. A observação 371 tem um lote de 1226 m². Já a observação 360 é a única casa de todo o banco com 4 banheiros, além de 4 andares e 3 vagas de garagem. Essas três casas possuem DFFITS praticamente nulo e COVRATIO maior que 1, ou seja, elas seguem o padrão do modelo e, por estarem em regiões com poucas observações, aumentam a precisão das estimativas.
+
+**Casas com preço mal ajustado (observações 77, 100, 209, 318 e 335).** São casas com alavancagem comum, mas com DFFITS alto e COVRATIO menor que 1, ou seja, o modelo erra bastante o preço delas e elas reduzem a precisão das estimativas. Quatro delas possuem preço bem abaixo do esperado pelas suas características. A observação 100, por exemplo, custa CAD 31.900 apesar de estar em um bairro de alta preferência e ter ar-condicionado central. A observação 209 custa CAD 50.000 com um lote de 883 m², 3 vagas de garagem e localização em bairro de alta preferência. A observação 335 é o caso oposto: custa CAD 132.000, valor bem acima do esperado para uma casa com lote de apenas 325 m².
+
+## Estudo de Sensibilidade
+
+Para avaliar o impacto dessas casas sobre as conclusões, ajustamos novamente o modelo sem as 8 observações marcadas e calculamos a variação relativa de cada coeficiente:
+
+$$
+VR_j = 100 \times \frac{\hat{\beta}_{j,\,\text{sem pontos}} - \hat{\beta}_{j,\,\text{original}}}{|\hat{\beta}_{j,\,\text{original}}|}
+$$
+
+```{r}
+#| label: p5-sensibilidade
+# Ajusta o modelo sem as casas atípicas
+modelo_sem <- update(modelo, data = treino_casas[-atipicas$obs, ])
+
+# Variação relativa dos coeficientes
+tab_sensibilidade <- data.frame(
+  Original = coef(modelo),
+  Sem_Atipicas = coef(modelo_sem),
+  VR = 100 * (coef(modelo_sem) - coef(modelo)) / abs(coef(modelo)),
+  p_Original = summary(modelo)$coefficients[, 4],
+  p_Sem_Atipicas = summary(modelo_sem)$coefficients[, 4]
+)
+
+tabela(tab_sensibilidade, digits = 4)
+
+# Compara as medidas globais dos dois modelos
+data.frame(
+  Modelo = c("Com todas as casas", "Sem as casas atípicas"),
+  n = c(nobs(modelo), nobs(modelo_sem)),
+  Sigma = c(sigma(modelo), sigma(modelo_sem)),
+  R2_adj = c(summary(modelo)$adj.r.squared, summary(modelo_sem)$adj.r.squared)
+)
+```
+
+As maiores variações relativas ocorreram nos coeficientes de `aquecimento_gas` (-19,2%), `entrada_carro` (-16,0%), `area_recreacao` (-15,4%) e `vagas_garagem` (+14,3%). Os coeficientes de `area_lote` (+3,6%) e `ar_condicionado` (+1,0%) praticamente não se alteraram. As maiores variações aparecem justamente em variáveis com poucas casas em um dos níveis: apenas 25 das 546 casas usam gás para aquecimento de água e apenas 77 não possuem entrada para automóveis. Nesses casos, poucas observações têm um peso maior na estimativa do coeficiente.
+
+Apesar dessas variações, nenhum coeficiente mudou de sinal e nenhuma variável mudou de conclusão quanto à significância ao nível de 5%. A variável com maior valor-p, `area_recreacao`, passou de $p = 0{,}016$ para $p = 0{,}036$, permanecendo significativa. Sem as 8 casas, o erro-padrão residual caiu de 0,0940 para 0,0905 e o $R^2$ ajustado subiu de 0,6675 para 0,6778, uma melhora pequena e esperada, já que foram retiradas justamente as casas que o modelo ajustava pior.
+
+Não há evidências de que essas casas sejam erros de registro: os valores de todas as variáveis estão dentro de faixas plausíveis, e o preço de uma casa pode realmente se afastar do esperado por características que não foram medidas no banco de dados, como o estado de conservação do imóvel ou a sua idade. As casas de alavanca, por sua vez, são propriedades de alto padrão legítimas, e retirá-las reduziria a capacidade do modelo de representar imóveis maiores. Como a remoção dessas observações não altera nenhuma conclusão do modelo, optamos por **mantê-las na análise**.
+
+# Inferência final, comparação no teste e previsões
+
+## Escopo e critérios de análise
+
+O banco descreve vendas de habitações em Windsor, Canadá, em 1987. Conforme
+o enunciado, `preco` está em **dólares canadenses (CAD)** e `area_lote` em
+**metros quadrados**. Os valores são históricos; não representam preços atuais.
+
+Esta etapa utiliza os objetos preparados pelo grupo e preserva sua divisão
+original: `r nrow(treino)` casas no treino e
+`r nrow(base$dados) - nrow(treino)` no teste. A variável resposta é
+$Y = \log_{10}(\text{preço})$. O modelo Stepwise da Parte 2, mantido nas
+Partes 4 e 5, é o modelo final **para interpretação e inferência**.
+As observações sinalizadas na análise de sensibilidade são mantidas.
+
+Os modelos Linear, Stepwise, B-Spline e KNN são avaliados no mesmo conjunto
+de teste, com especificações definidas antes de examinar seus erros nesse
+conjunto. O teste é usado para avaliação final, não para escolher novos
+hiperparâmetros ou remover observações. A comparação principal usa a escala
+logarítmica, a mesma utilizada no ajuste e na validação cruzada.
+
+**Limitação da separação treino/teste.** No script original `preparacao.R`, o
+diagnóstico de Box-Cox foi realizado com toda a base, antes da separação. Assim,
+a escolha da transformação já teve acesso indireto aos preços do teste.
+Preserva-se essa decisão para manter a compatibilidade com as etapas anteriores,
+mas a avaliação não deve ser descrita como totalmente cega desde o início do
+projeto. Nesta etapa, o ajuste de KNN e o processamento das covariáveis usam
+exclusivamente o treino. Um novo estudo deve reservar o teste antes de qualquer
+decisão sobre transformações.
+
+## Inferência do modelo final
+
+### ANOVA global e intervalos dos coeficientes
+
+O teste F global confronta $H_0: \beta_1 = \cdots = \beta_p = 0$ com a
+alternativa de que pelo menos um coeficiente angular seja diferente de zero.
+Ele não testa causalidade nem garante bom desempenho preditivo fora da amostra.
+
+```{r}
+#| label: p6-anova
+#| echo: false
+invisible(capture.output(anova_final <- reglin::tab_anova(modelo_final)))
+ic_beta <- confint(modelo_final, level = 0.95)
+```
+
+```{r}
+#| label: p6-tabela-anova
+anova_exibir <- as.data.frame(anova_final)
+anova_exibir[["Pr(>F)"]] <- ifelse(is.na(anova_exibir[["Pr(>F)"]]), "",
+                                      valor_p(anova_exibir[["Pr(>F)"]]))
+tabela(anova_exibir, digits = 4,
+       caption = "ANOVA global do modelo final; resposta em log10(CAD).")
+resumo_final <- summary(modelo_final)
+f_global <- resumo_final$fstatistic
+p_global <- pf(f_global[1], f_global[2], f_global[3], lower.tail = FALSE)
+```
+
+O teste apresenta $F =$ `r formato(f_global[1], 2)`, com
+`r f_global[2]` e `r f_global[3]` graus de liberdade, e valor-p
+`r valor_p(p_global)`. O $R^2$ ajustado no treino é
+`r formato(100 * resumo_final$adj.r.squared, 2)`%, referente à variabilidade
+do **logaritmo do preço**, e o desvio-padrão residual é
+`r formato(sigma(modelo_final), 4)` nessa escala. Esses resultados descrevem
+o ajuste no treino e não substituem a avaliação no teste.
+
+```{r}
+#| label: p6-coeficientes
+nomes <- c(
+  "(Intercept)" = "Intercepto", area_lote = "Área do lote",
+  quartos = "Quartos", banheiros = "Banheiros", andares = "Andares",
+  entrada_carrosim = "Entrada para carro", area_recreacaosim = "Recreação",
+  poraosim = "Porão acabado", aquecimento_gassim = "Água aquecida a gás",
+  ar_condicionadosim = "Ar-condicionado", vagas_garagem = "Vagas de garagem",
+  area_preferencialsim = "Área preferencial"
+)
+coeficientes <- data.frame(
+  termo = names(coef(modelo_final)), beta = unname(coef(modelo_final)),
+  inferior = ic_beta[, 1], superior = ic_beta[, 2],
+  p = resumo_final$coefficients[, 4], row.names = NULL
+)
+stopifnot(all(coeficientes$termo %in% names(nomes)))
+tabela(data.frame(
+  Parâmetro = unname(nomes[coeficientes$termo]),
+  Estimativa = formato(coeficientes$beta, 6),
+  `IC 95% inferior` = formato(coeficientes$inferior, 6),
+  `IC 95% superior` = formato(coeficientes$superior, 6),
+  `Valor-p` = valor_p(coeficientes$p), check.names = FALSE
+), caption = "Coeficientes e intervalos de confiança condicionais ao modelo selecionado.")
+```
+
+**Alcance da inferência.** Os intervalos e testes usuais de `lm` são
+condicionais à especificação escolhida e não incorporam a incerteza da seleção
+Stepwise. Os diagnósticos anteriores também apontam desvios de normalidade e
+curvatura em `area_lote`. Por isso, os resultados devem ser apresentados como
+inferência aproximada sob o modelo linear adotado; o teste de normalidade não
+é uma justificativa para afirmar que todos os pressupostos foram atendidos.
+
+### Interpretação econômica de cada parâmetro
+
+No modelo semilogarítmico em base 10, uma variação de $\Delta$ unidades em uma
+covariável numérica está associada à variação de
+
+$$100\left(10^{\hat\beta_j\Delta}-1\right)\%$$
+
+na média geométrica condicional do preço, mantendo as outras covariáveis
+constantes. Sob erros normais, ela também corresponde à mediana condicional.
+Para uma variável binária, $\Delta=1$ compara **sim** com **não**. A mesma
+transformação dos limites de `confint()` fornece o intervalo para essa
+variação percentual. As associações não devem ser interpretadas como efeitos
+causais de reformas ou de mudanças de localização.
+
+```{r}
+#| label: p6-interpretacoes
+#| results: asis
+contextos <- c(
+  area_lote = "um aumento de 1 m² no terreno",
+  quartos = "um quarto adicional", banheiros = "um banheiro completo adicional",
+  andares = "um andar adicional, excluindo o porão",
+  entrada_carrosim = "a presença de entrada para automóveis",
+  area_recreacaosim = "a presença de sala de recreação/jogos",
+  poraosim = "a presença de porão totalmente acabado",
+  aquecimento_gassim = "o uso de gás para aquecimento de água",
+  ar_condicionadosim = "a presença de ar-condicionado central",
+  vagas_garagem = "uma vaga adicional de garagem",
+  area_preferencialsim = "a localização em bairro de alta preferência"
+)
+for (i in seq_len(nrow(coeficientes))) {
+  z <- coeficientes[i, ]
+  if (z$termo == "(Intercept)") {
+    cat("- **Intercepto:** estima log10(preço) = ", formato(z$beta, 4),
+        ", equivalente a CAD ", formato(10^z$beta, 0),
+        " na média geométrica, quando todas as covariáveis numéricas valem zero ",
+        "e as binárias estão em 'não'. Uma casa sem terreno, quartos e banheiros ",
+        "não é um cenário habitacional plausível; o intercepto cumpre principalmente ",
+        "a função de posicionar a superfície de regressão.\n\n", sep = "")
+  } else {
+    ef <- 100 * (10^c(z$beta, z$inferior, z$superior) - 1)
+    cat("- **", unname(nomes[z$termo]), ":** ", contextos[z$termo],
+        " associa-se a uma variação de ", formato(ef[1]),
+        "% no preço típico condicional (IC 95%: ", formato(ef[2]),
+        "% a ", formato(ef[3]), "%); as demais características são mantidas fixas.\n\n",
+        sep = "")
+  }
+}
+```
+
+Para facilitar a leitura do efeito da área, 100 m² adicionais correspondem a
+uma variação de `r formato(100 * (10^(100 * coef(modelo_final)["area_lote"]) - 1))`%
+no preço típico condicional. Essa interpretação usa o efeito constante do modelo
+linear; a curvatura investigada na Parte 3 pode tornar essa aproximação menos
+adequada nos extremos da área do terreno.
+
+## Comparação preditiva no teste
+
+### Preparação dos quatro modelos
+
+O modelo Linear utiliza as 11 covariáveis originais. O Stepwise usa a fórmula
+selecionada na Parte 2, exclusivamente a partir do treino. Como o procedimento
+manteve todas as covariáveis, os dois ajustes devem gerar previsões iguais.
+
+Para o B-Spline, reconstrói-se o workflow da Parte 3 com os graus de liberdade
+já escolhidos pela regra de um erro-padrão. Isso preserva o processamento de
+`step_spline_b()` para novas observações e dispensa refazer a seleção com o teste.
+
+O KNN usa distância euclidiana e pesos uniformes. As categorias são codificadas
+em indicadores; variáveis sem variação são removidas e as covariáveis são
+padronizadas **dentro de cada dobra**. Avaliam-se valores ímpares de $k$ entre
+3 e 51 nas mesmas dez dobras do grupo. A regra de um erro-padrão escolhe o maior
+$k$ elegível, favorecendo uma previsão mais suave. A padronização automática do
+motor `kknn` é desativada para não duplicar a transformação da receita.
+
+```{r}
+#| label: p6-workflows
+#| echo: false
+espec_lm <- linear_reg() |> set_engine("lm")
+wf_linear <- workflow() |>
+  add_formula(formula_completa) |> add_model(espec_lm)
+wf_stepwise <- workflow() |>
+  add_formula(formula_final) |> add_model(espec_lm)
+
+df_spline <- as.integer(p3$melhor_df$deg_free[1])
+stopifnot(length(df_spline) == 1, df_spline >= 3)
+receita_spline <- recipe(formula_completa, data = treino) |>
+  step_spline_b(area_lote, deg_free = df_spline, degree = 3) |>
+  step_dummy(all_nominal_predictors())
+wf_spline <- workflow() |>
+  add_recipe(receita_spline) |> add_model(espec_lm)
+
+receita_knn <- recipe(formula_completa, data = treino) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+wf_knn <- workflow() |>
+  add_recipe(receita_knn) |>
+  add_model(nearest_neighbor(neighbors = tune(), weight_func = "rectangular",
+                             dist_power = 2) |>
+              set_engine("kknn", scale = FALSE) |> set_mode("regression"))
+set.seed(606)
+ajuste_knn <- tune_grid(
+  wf_knn, resamples = dobras,
+  grid = data.frame(neighbors = seq(3L, 51L, 2L)),
+  metrics = metric_set(rmse, rsq),
+  control = control_grid(save_pred = FALSE)
+)
+cv_knn <- collect_metrics(ajuste_knn)
+stopifnot(all(is.finite(cv_knn$mean)), all(cv_knn$n == nrow(dobras)))
+melhor_knn <- select_by_one_std_err(ajuste_knn, desc(neighbors), metric = "rmse")
+rmse_knn_cv <- cv_knn$mean[cv_knn$.metric == "rmse" &
+                         cv_knn$neighbors == melhor_knn$neighbors]
+wf_knn_final <- finalize_workflow(wf_knn, melhor_knn)
+```
+
+O B-Spline utiliza `r df_spline` graus de liberdade. Para o KNN, a regra
+selecionou $k =$ `r melhor_knn$neighbors`; o RMSE médio de validação desse
+candidato é `r formato(rmse_knn_cv, 4)` em log10(CAD).
+
+```{r}
+#| label: p6-curva-knn
+#| fig-cap: "Escolha de k usando apenas validação cruzada no treino. Barras: um erro-padrão entre as dobras."
+#| fig-height: 3.5
+cv_knn |>
+  filter(.metric == "rmse") |>
+  ggplot(aes(neighbors, mean)) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err),
+                width = 0.5, color = "grey65") +
+  geom_line(color = "#225b78") + geom_point(color = "#225b78", size = 1.5) +
+  geom_vline(xintercept = melhor_knn$neighbors, linetype = 2) +
+  labs(x = "Número de vizinhos (k)", y = "RMSE de validação em log10(CAD)")
+```
+
+### Avaliação final com `last_fit()`
+
+As especificações estão agora fixadas. Cada chamada a `last_fit()` ajusta o
+workflow em todo o treino original e calcula previsões para o teste reservado.
+As tabelas são extraídas com `collect_metrics()` e os gráficos com
+`collect_predictions()`.
+
+```{r}
+#| label: p6-last-fit
+#| echo: false
+workflows_finais <- list(Linear = wf_linear, Stepwise = wf_stepwise,
+                         `B-Spline` = wf_spline, KNN = wf_knn_final)
+metricas <- metric_set(rmse, rsq, rsq_trad)
+set.seed(607)
+resultados_teste <- lapply(workflows_finais, function(wf) {
+  last_fit(wf, split = split_casas, metrics = metricas)
+})
+metricas_teste <- purrr::imap_dfr(resultados_teste, function(x, nome) {
+  collect_metrics(x) |> mutate(Modelo = nome)
+})
+predicoes_teste <- purrr::imap_dfr(resultados_teste, function(x, nome) {
+  collect_predictions(x) |> mutate(Modelo = nome)
+})
+stopifnot(all(is.finite(metricas_teste$.estimate)),
+          all(is.finite(predicoes_teste$.pred)))
+n_teste <- nrow(testing(split_casas))
+stopifnot(all(table(predicoes_teste$Modelo) == n_teste))
+## .row identifica a linha na base que originou o split; conferimos o pareamento.
+stopifnot(isTRUE(all.equal(predicoes_teste$preco_log,
+                          split_casas$data$preco_log[predicoes_teste$.row])))
+comparacao <- metricas_teste |>
+  select(Modelo, .metric, .estimate) |>
+  tidyr::pivot_wider(names_from = .metric, values_from = .estimate) |>
+  arrange(rmse)
+```
+
+São apresentados dois índices distintos: `rsq` é a correlação ao quadrado
+entre observado e previsto; `rsq_trad` é o $R^2$ preditivo baseado em erros,
+
+$$R^2_{\mathrm{pred}}=1-\frac{\sum_i(y_i-\hat y_i)^2}
+{\sum_i(y_i-\bar y_{\mathrm{teste}})^2}.$$
+
+O segundo pode ser negativo e penaliza erros de calibração. O RMSE é
+$\sqrt{\sum_i(y_i-\hat y_i)^2/n_{\mathrm{teste}}}$; valores menores são melhores.
+Todos os números da tabela se referem às mesmas casas e à mesma escala.
+
+```{r}
+#| label: p6-tabela-teste
+tabela(comparacao |>
+         transmute(Modelo, `RMSE log10` = rmse, `R² preditivo` = rsq_trad,
+                   `Correlação²` = rsq), digits = 4,
+       caption = "Desempenho no teste reservado (resposta: log10 do preço).")
+melhor_observado <- comparacao$Modelo[1]
+pred_linear <- predicoes_teste |> filter(Modelo == "Linear") |> arrange(.row)
+pred_step <- predicoes_teste |> filter(Modelo == "Stepwise") |> arrange(.row)
+stopifnot(isTRUE(all.equal(pred_linear$.pred, pred_step$.pred, tolerance = 1e-8)))
+```
+
+Neste conjunto de teste, o menor RMSE observado foi o de **`r melhor_observado`**
+(`r formato(comparacao$rmse[1], 4)`), com $R^2$ preditivo de
+`r formato(comparacao$rsq_trad[1], 4)`. Isso descreve esta amostra de teste;
+não demonstra superioridade universal nem diferença estatisticamente significativa
+entre os métodos. Linear e Stepwise produzem o mesmo resultado, pois suas
+fórmulas são iguais. O modelo interpretativo não é trocado depois dessa comparação.
+
+```{r}
+#| label: p6-observados-preditos
+#| fig-cap: "Observado versus previsto no teste. A linha tracejada representa previsão perfeita."
+#| fig-height: 6
+ggplot(predicoes_teste, aes(x = preco_log, y = .pred)) +
+  geom_abline(intercept = 0, slope = 1, linetype = 2, color = "grey40") +
+  geom_point(color = "#225b78", alpha = 0.65, size = 1.5) +
+  facet_wrap(~Modelo, ncol = 2) + coord_equal() +
+  labs(x = "Preço observado em log10(CAD)", y = "Preço previsto em log10(CAD)")
+```
+
+### Leitura complementar em dólares canadenses
+
+Para dar uma noção monetária do erro, também se calculam métricas após a
+transformação direta $10^{\hat y}$. Essas previsões correspondem ao preço
+geométrico previsto e **não são estimativas corrigidas da média aritmética**.
+A transformação altera o peso dado aos imóveis caros, de modo que a ordenação
+dos modelos em CAD pode diferir da ordenação na escala logarítmica.
+
+```{r}
+#| label: p6-metricas-cad
+predicoes_teste <- predicoes_teste |>
+  mutate(observado_cad = 10^preco_log, previsto_cad = 10^.pred)
+metricas_cad <- predicoes_teste |>
+  group_by(Modelo) |>
+  summarise(RMSE_CAD = rmse_vec(observado_cad, previsto_cad),
+            R2_pred = rsq_trad_vec(observado_cad, previsto_cad), .groups = "drop") |>
+  arrange(RMSE_CAD)
+tabela(metricas_cad |> transmute(Modelo, `RMSE (CAD)` = formato(RMSE_CAD, 0),
+                                 `R² preditivo` = formato(R2_pred, 4)),
+       caption = "Métricas monetárias das previsões diretamente retransformadas.")
+```
+
+## Cenários e intervalos de incerteza
+
+### Construção dos cenários
+
+Comparam-se terrenos de 300 e 600 m², com um ou dois banheiros, em bairros
+preferenciais ou não. As demais características ficam fixas: três quartos,
+dois andares, uma vaga de garagem, entrada para carro e porão acabado, sem sala
+de recreação, sem aquecimento de água a gás e sem ar-condicionado central.
+São **cenários hipotéticos**, não imóveis efetivamente observados.
+As faixas individuais são conferidas no treino; isso não garante que cada
+combinação completa tenha muitos imóveis comparáveis.
+
+```{r}
+#| label: p6-cenarios
+#| echo: false
+cenarios <- expand.grid(
+  area_lote = c(300, 600), banheiros = c(1, 2),
+  area_preferencial = c("não", "sim"),
+  KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE
+)
+cenarios$quartos <- 3
+cenarios$andares <- 2
+cenarios$vagas_garagem <- 1
+cenarios$entrada_carro <- "sim"
+cenarios$porao <- "sim"
+cenarios$area_recreacao <- "não"
+cenarios$aquecimento_gas <- "não"
+cenarios$ar_condicionado <- "não"
+for (v in preditoras) {
+  if (is.factor(treino[[v]])) {
+    cenarios[[v]] <- factor(cenarios[[v]], levels = levels(treino[[v]]))
+  } else {
+    stopifnot(all(cenarios[[v]] >= min(treino[[v]])),
+              all(cenarios[[v]] <= max(treino[[v]])))
+  }
+}
+stopifnot(!anyNA(cenarios))
+cenarios$id <- paste0("C", seq_len(nrow(cenarios)))
+ic_log <- predict(modelo_final, newdata = cenarios,
+                  interval = "confidence", level = 0.95)
+ip_log <- predict(modelo_final, newdata = cenarios,
+                  interval = "prediction", level = 0.95)
+```
+
+O intervalo de confiança de `predict(..., interval = "confidence")` é para
+$E[\log_{10}(P)\mid X]$. Ao elevar seus limites à base 10, obtém-se um intervalo
+para a **média geométrica** (e, sob normalidade, a mediana), não para
+$E[P\mid X]$. Já o intervalo de predição transformado é para o preço de uma
+**nova habitação** com as características especificadas, sob as hipóteses do modelo.
+
+```{r}
+#| label: p6-tabela-log
+tab_log <- data.frame(
+  Cenário = cenarios$id, `Área (m²)` = cenarios$area_lote,
+  Banheiros = cenarios$banheiros,
+  Preferencial = as.character(cenarios$area_preferencial),
+  `Média log10` = ic_log[, "fit"],
+  `IC inferior` = ic_log[, "lwr"], `IC superior` = ic_log[, "upr"],
+  check.names = FALSE
+)
+tabela(tab_log, digits = 4,
+       caption = "Cenários e IC de 95% para a resposta média na escala de ajuste.")
+```
+
+### Média aritmética em CAD e previsão de uma nova habitação
+
+Sob a hipótese adicional de erros normais com variância constante
+$\sigma^2$, a média monetária é
+
+$$E[P\mid X=x]=\exp\left\{\ln(10)x^\top\beta+
+\tfrac12[\ln(10)]^2\sigma^2\right\}.$$
+
+Para incluir a incerteza dos coeficientes e da variância residual, calcula-se
+um IC percentil por **bootstrap paramétrico**, com
+`r params$bootstrap` réplicas. Em cada réplica são simuladas respostas
+logarítmicas no treino, a mesma fórmula é reajustada e a média monetária é
+recalculada. A especificação permanece fixa; a seleção Stepwise não é repetida.
+Esse procedimento depende da hipótese normal e não elimina as ressalvas dos
+diagnósticos anteriores. Os intervalos são pontuais de 95%, não simultâneos.
+
+```{r}
+#| label: p6-bootstrap-media
+#| echo: false
+X <- model.matrix(modelo_final)
+Xnovo <- model.matrix(delete.response(terms(modelo_final)), cenarios,
+                     contrasts.arg = modelo_final$contrasts,
+                     xlev = modelo_final$xlevels)
+stopifnot(identical(colnames(X), colnames(Xnovo)))
+a <- log(10)
+media_cad <- exp(a * ic_log[, "fit"] + 0.5 * a^2 * sigma(modelo_final)^2)
+B <- as.integer(params$bootstrap)
+stopifnot(B >= 1000)
+set.seed(608)
+medias_boot <- replicate(B, {
+  yb <- fitted(modelo_final) + rnorm(nrow(X), sd = sigma(modelo_final))
+  mb <- lm.fit(x = X, y = yb)
+  s2b <- sum(mb$residuals^2) / (nrow(X) - mb$rank)
+  exp(a * drop(Xnovo %*% mb$coefficients) + 0.5 * a^2 * s2b)
+})
+ic_media_cad <- t(apply(medias_boot, 1, quantile, probs = c(0.025, 0.975)))
+previsoes_cenarios <- data.frame(
+  cenarios, mediana_cad = 10^ic_log[, "fit"],
+  ic_geometrica_inf = 10^ic_log[, "lwr"],
+  ic_geometrica_sup = 10^ic_log[, "upr"],
+  media_cad = media_cad,
+  ic_media_inf = ic_media_cad[, 1], ic_media_sup = ic_media_cad[, 2],
+  ip_nova_inf = 10^ip_log[, "lwr"], ip_nova_sup = 10^ip_log[, "upr"]
+)
+stopifnot(all(is.finite(as.matrix(previsoes_cenarios[,
+  c("media_cad", "ic_media_inf", "ic_media_sup", "ip_nova_inf", "ip_nova_sup")]))),
+  all(ip_log[, "lwr"] < ic_log[, "lwr"]),
+  all(ip_log[, "upr"] > ic_log[, "upr"]))
+```
+
+```{r}
+#| label: p6-tabela-cenarios
+intervalo <- function(inf, sup) paste0(formato(inf, 0), " a ", formato(sup, 0))
+tabela(data.frame(
+  Cenário = previsoes_cenarios$id,
+  `Média (CAD)` = formato(previsoes_cenarios$media_cad, 0),
+  `IC 95% da média` = intervalo(previsoes_cenarios$ic_media_inf,
+                               previsoes_cenarios$ic_media_sup),
+  `IP 95% nova casa` = intervalo(previsoes_cenarios$ip_nova_inf,
+                                previsoes_cenarios$ip_nova_sup),
+  check.names = FALSE
+), caption = "Média aritmética e intervalos em dólares canadenses históricos.")
+```
+
+```{r}
+#| label: p6-grafico-intervalos
+#| fig-cap: "Incerteza por cenário: intervalo de predição de uma casa (cinza), IC da média (azul) e média estimada (ponto)."
+#| fig-height: 4.5
+ggplot(previsoes_cenarios, aes(y = reorder(id, media_cad))) +
+  geom_segment(aes(x = ip_nova_inf, xend = ip_nova_sup,
+                   yend = reorder(id, media_cad)), linewidth = 2, color = "grey75") +
+  geom_segment(aes(x = ic_media_inf, xend = ic_media_sup,
+                   yend = reorder(id, media_cad)), linewidth = 3, color = "#225b78") +
+  geom_point(aes(x = media_cad), size = 2, color = "#122b39") +
+  scale_x_continuous(labels = scales::label_number(big.mark = ".", decimal.mark = ",")) +
+  labs(x = "Preço em CAD", y = "Cenário")
+```
+
+Por exemplo, o cenário C1 (300 m², um banheiro, bairro não preferencial e
+demais características fixadas acima) tem média estimada de CAD
+`r formato(previsoes_cenarios$media_cad[1], 0)`, com IC de 95% de CAD
+`r intervalo(previsoes_cenarios$ic_media_inf[1], previsoes_cenarios$ic_media_sup[1])`.
+O intervalo de predição para uma nova casa vai de CAD
+`r intervalo(previsoes_cenarios$ip_nova_inf[1], previsoes_cenarios$ip_nova_sup[1])`.
+O segundo intervalo incorpora a variabilidade entre habitações que não é
+explicada pelas covariáveis, além da incerteza de estimação.
+
+## Síntese e limites
+
+O modelo interpretativo associa características do lote, da construção e da
+localização ao preço das casas, controladas as demais variáveis observadas.
+Os coeficientes são interpretados na escala correta de logaritmo decimal,
+e os intervalos distinguem a resposta média de uma nova observação.
+
+A comparação preditiva utiliza o mesmo teste para todos os modelos e mantém
+o ajuste de hiperparâmetros no treino. O menor RMSE de teste observado foi o
+de `r melhor_observado`, mas o resultado deve ser lido à luz da amostra limitada,
+da escolha prévia da transformação com a base completa e da ausência de um
+teste formal de diferenças de desempenho. A análise não demonstra causalidade
+e não pode ser extrapolada automaticamente para imóveis atuais ou outras cidades.
+
+Os intervalos clássicos e o bootstrap paramétrico dependem da especificação
+adotada. A normalidade imperfeita dos resíduos, a curvatura da área e a seleção
+de variáveis são limitações relevantes para a cobertura nominal de 95%.
+
+## Referências técnicas
+
+- Enunciado da disciplina: descrição dos imóveis de Windsor em 1987, unidades
+  das variáveis e entrega em Quarto/PDF.
+- [reglin: ANOVA e ferramentas de regressão](https://fndemarqui.r-universe.dev/reglin/doc/manual.html).
+- [tune: ajuste final com last_fit](https://tune.tidymodels.org/reference/last_fit.html).
+- [recipes: bases B-spline](https://recipes.tidymodels.org/reference/step_spline_b.html).
+- [parsnip: KNN com kknn](https://parsnip.tidymodels.org/reference/details_nearest_neighbor_kknn.html).
+- [yardstick: definição de R² tradicional](https://yardstick.tidymodels.org/reference/rsq_trad.html).
+- [R: intervalos em predict.lm](https://stat.ethz.ch/R-manual/R-devel/library/stats/html/predict.lm.html).
+
+```{r}
+#| label: p6-exportacoes
+#| include: false
+## Auditoria independente das metricas extraidas pelo tidymodels.
+for (nome in names(workflows_finais)) {
+  z <- predicoes_teste[predicoes_teste$Modelo == nome, ]
+  rmse_manual <- sqrt(mean((z$preco_log - z$.pred)^2))
+  r2_manual <- 1 - sum((z$preco_log - z$.pred)^2) /
+    sum((z$preco_log - mean(z$preco_log))^2)
+  linha <- comparacao[comparacao$Modelo == nome, ]
+  stopifnot(isTRUE(all.equal(rmse_manual, linha$rmse)),
+            isTRUE(all.equal(r2_manual, linha$rsq_trad)))
+}
+dir.create("resultados_parte6", showWarnings = FALSE)
+write.csv(coeficientes, "resultados_parte6/coeficientes.csv", row.names = FALSE)
+write.csv(comparacao, "resultados_parte6/metricas_teste_log.csv", row.names = FALSE)
+write.csv(metricas_cad, "resultados_parte6/metricas_teste_cad.csv", row.names = FALSE)
+write.csv(previsoes_cenarios, "resultados_parte6/cenarios.csv", row.names = FALSE)
+write.csv(predicoes_teste, "resultados_parte6/predicoes_teste.csv", row.names = FALSE)
+saveRDS(list(anova = anova_final, coeficientes = coeficientes,
+             resultados_teste = resultados_teste, metricas = comparacao,
+             metricas_cad = metricas_cad, cenarios = previsoes_cenarios,
+             knn_cv = cv_knn, knn_escolhido = melhor_knn, df_spline = df_spline),
+        "resultados_parte6/resultados.rds")
+writeLines(capture.output(sessionInfo()), "resultados_parte6/sessionInfo.txt")
+```
+
