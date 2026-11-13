@@ -666,13 +666,12 @@ Os resíduos estudentizados externamente apresentaram amplitude semelhante aos i
 Para complementar a análise descritiva dos resíduos, foram utilizados os gráficos diagnósticos da função ggresiduals(), disponibilizada pelo pacote reglin, e os testes estatístico disponibilizados pela função testResiduals(). Essa análise tem como objetivo verificar se os pressupostos do modelo de regressão linear múltipla são razoavelmente atendidos, especialmente em relação à normalidade dos resíduos, à homocedasticidade e à presença de observações atípicas.
 
 ### Análise dos Gráficos Diagnósticos
+O gráfico a seguir apresenta os gráficos diagnósticos do modelo ajustado com a variável resposta transformada em logaritmo (preco_log).
 
 ```{r}
 #| label: p4-bloco-5
 ggresiduals(modelo)
 ```
-
-O gráfico a seguir apresenta os gráficos diagnósticos do modelo ajustado com a variável resposta transformada em logaritmo (preco_log).
 
 No gráfico Resíduos versus Valores Ajustados, os resíduos apresentam distribuição aleatória em torno de zero, indicando que a relação entre as variáveis explicativas e a variável resposta está adequadamente representada pelo modelo.
 
@@ -691,10 +690,22 @@ testResiduals(modelo)
 ```
 
 #### Normalidade dos resíduos - Teste de Shapiro-Wilk
-O teste de Shapiro-Wilk apresentou estatística W = 0,9909 e p-valor = 0,008944. Considerando o nível de significância de 5%, rejeita-se a hipótese nula de normalidade, indicando evidências estatísticas de que os resíduos não seguem uma distribuição normal, o que também foi indicado pelo gráfico. 
+As hipóteses testadas pelo teste de Shapiro-Wilk são:
+
+* $H_0$: Os resíduos seguem uma distribuição normal.
+
+* $H_1$: Os resíduos não seguem uma distribuição normal.
+
+O teste apresentou estatística W = 0,9909 e p-valor = 0,008944. Considerando o nível de significância de 5%, rejeita-se a hipótese nula de normalidade, indicando evidências estatísticas de que os resíduos não seguem uma distribuição normal, o que também foi indicado pelo gráfico. 
 
 #### Homocedasticidade - Teste de variância não constante
-O teste de variância não constante apresentou estatística qui-quadrado = 0,677467 e p-valor = 0,41046. Como o p-valor é superior a 0,05, não se rejeita a hipótese nula de variância constante dos erros. Dessa forma, não foram encontradas evidências estatísticas de heterocedasticidade.
+As hipóteses testadas pelo teste de variância não constante são:
+
+* $H_0$: A variância dos erros é constante (homocedasticidade).
+
+* $H_1$: A variância dos erros não é constante (heterocedasticidade).
+
+O teste apresentou estatística qui-quadrado = 0,677467 e p-valor = 0,41046. Considerando o nível de significância de 5%, não se rejeita a hipótese nula de variância constante dos erros. Dessa forma, não foram encontradas evidências estatísticas de heterocedasticidade.
 
 ```{r}
 #| label: p4-dw-ordem
@@ -707,15 +718,19 @@ dw_permutado <- replicate(1000, {
 ```
 
 #### Independência dos resíduos - Teste de Durbin-Watson
-O teste de Durbin-Watson apresentou estatística DW = 1,1923 e valor-p aproximadamente igual a zero. Esse resultado indica evidências de autocorrelação positiva entre os resíduos, sugerindo possível violação do pressuposto de independência dos erros.
+As hipóteses testadas pelo teste de Durbin-Watson são:
 
-É importante notar que o teste de Durbin-Watson é utilizado para séries temporais, sendo sua aplicação em dados com "organização" transversal limitada, uma vez que o resultado pode ser influenciado pela ordem das observações. Para verificar a sensibilidade à ordem, foram feitos 1.000 embaralhamentos dos resíduos, com média da estatística DW de `r formato(mean(dw_permutado), 4)`. Essa checagem não prova independência dos erros. Esse resultado sugere que a autocorrelação identificada na ordem original pode estar relacionada à disposição dos dados, não sendo possível concluir, apenas com esse teste, pela existência de dependência entre os erros do modelo.
+* $H_0$: Não há autocorrelação nos resíduos ($\rho = 0$).
+
+* $H_1$: Há autocorrelação nos resíduos ($\rho \neq 0$).
+
+O teste apresentou estatística DW = 1,1923 e p-valor aproximadamente igual a zero. Portanto, à um nível de significância de 5%, rejeitamos a hipótese nula, o que indica evidências de autocorrelação positiva entre os resíduos, sugerindo possível violação do pressuposto de independência dos erros.
 
 #### Identificação de observações atípicas - Teste de Bonferroni
 Por fim, o teste de Bonferroni não identificou resíduos estudentizados significativamente discrepantes, considerando o nível de significância de 5%.
 
 ### Conclusões
-O teste de variância não constante não apontou evidências de heterocedasticidade, e o teste de Bonferroni não identificou outliers significativos. O resultado do teste de Durbin-Watson merece atenção, mas sua interpretação é limitada pela natureza transversal dos dados e pela ordem das observações.
+O teste de variância não constante não apontou evidências de heterocedasticidade, e o teste de Bonferroni não identificou outliers significativos. Por sua vez, o teste de Durbin-Watson indicou a presença de autocorrelação positiva entre os resíduos.
 
 Assim, considerando os diagnósticos realizados, o modelo transformado apresenta adequação razoável aos pressupostos avaliados, com ressalva quanto à normalidade dos resíduos e à autocorrelação indicada pelo teste de Durbin-Watson.
 
@@ -733,8 +748,6 @@ car::avPlots(modelo, layout = c(3, 4), ask = FALSE)
 
 Todos os gráficos apresentados acima exibem uma tendência positiva, embora com diferentes graus de inclinação, indicando que as variáveis explicativas apresentam associação parcial positiva com o preço.
 
-É interessante notar que as variáveis categóricas binárias assumem originalmente os valores 0 e 1, correspondentes a "não" e "sim", respectivamente. Entretanto, nos gráficos avPlots, os valores representados não se restringem necessariamente a esses dois pontos, uma vez que refletem os resíduos das variáveis após o controle pelas demais variáveis explicativas do modelo.
-
 ### Gráficos crPlots
 
 ```{r}
@@ -744,20 +757,10 @@ Todos os gráficos apresentados acima exibem uma tendência positiva, embora com
 car::crPlots(modelo, layout = c(3, 4), ask = FALSE)
 ```
 
-Na imagem apresentada acima, a grande maioria dos gráficos das variáveis contínuas apresenta uma proximidade satisfatória entre a linha do componente linear e a curva suavizada, indicando adequação da especificação linear.A única exceção ocorre na variável area_lote, cuja curva suavizada exibe uma curvatura acentuada em relação à reta do componente linear, evidenciando que a relação não é estritamente linear e justificando a necessidade de correções por meio de termos polinomiais ou splines.
+Na análise dos resíduos parciais, a grande maioria das variáveis apresenta uma proximidade satisfatória entre a linha do componente linear e a curva suavizada, indicando adequação da especificação linear. A única exceção ocorre na variável `area_lote`, cuja curva suavizada exibe uma curvatura acentuada em relação à reta do componente linear, evidenciando que a relação não é estritamente linear.
 
-#### Adequação de area_lote
-Para "corrigir" a não-linearidade apresentada no gráfico de resíduos parciais da variável explicativa area_lote, o modelo foi reajustado com regressão polinomial e o comportamento dos resultados parciais foi avaliado novamente.
-
-```{r}
-#| label: p4-bloco-7
-modelo_area_lote_corrigido <- update(modelo, . ~ . - area_lote + poly(area_lote, degree = 2, raw = FALSE))
-
-car::crPlots(modelo_area_lote_corrigido, terms = ~ poly(area_lote, degree = 2, raw = FALSE))
-
-```
-
-Após o ajuste com regressão polinomial é possível observar o alinhamento entre a linha teórica do modelo e a linha suavizada dos resíduos parciais, o que mostra que a inadequação estrutural da variável foi atenuada no diagnóstico gráfico.
+#### Adequação de `area_lote`
+Conforme abordado nos tópicos anteriores do projeto, a não-lineariedade identificada para a variável explicativa `area_lote` foi tratada por meio do ajuste com regressão polinomial. Após esse ajuste, conforme o gráfico apresentado no tópico anterior, é possível observar o alinhamento adequado entre a linha teórica do modelo e a linha suavizada dos resíduos parciais, o que demonstra que a inadequação estrutural da variável foi devidamente atenuada.
 
 ## Comparação entre Variável Resposta Original e Transformada
 
@@ -794,7 +797,7 @@ A principal melhora ocorreu na homocedasticidade. O modelo original apresentou e
 
 Em relação aos valores discrepantes, o modelo original apresentou duas observações identificadas pelo teste de Bonferroni (380 e 332), enquanto o modelo transformado não apresentou observações significativamente discrepantes.
 
-O teste de Durbin-Watson indicou autocorrelação positiva nos dois modelos, sendo necessária cautela na interpretação devido à natureza transversal dos dados.
+O teste de Durbin-Watson indicou autocorrelação positiva nos dois modelos.
 
 ## Mínimos Quadrados Ponderados
 Considerando que o modelo com resposta transformada não apresentou evidências estatísticas de heterocedasticidade, não foi considerada necessária a aplicação de mínimos quadrados ponderados (WLS).
